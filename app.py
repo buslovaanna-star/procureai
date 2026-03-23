@@ -98,6 +98,8 @@ def run_analysis(sheets, sheet_map, params):
     LEAD     = params['lead']
     SAFETY   = params['safety']
     SAFETY60 = params['safety60']
+    SAFETY90 = params.get('safety90', 90)
+    DISC_THR2 = params.get('disc_thr2', 40)
     A_MULT   = params['a_mult']
     MG_A     = params['mg_a']
     MIN_MO   = params['min_months']
@@ -263,6 +265,7 @@ def run_analysis(sheets, sheet_map, params):
         p_disc  = pi[2] if pi else 0
         p_price = pi[0] if pi else None
         use_60  = not is_sp and p_avail and p_disc >= DISC_THR
+        use_90  = not is_sp and p_avail and p_disc >= DISC_THR2
 
         # Маржинальний дохід
         mi_day = None
@@ -276,7 +279,9 @@ def run_analysis(sheets, sheet_map, params):
               else 'Надлишок' if dl>90 else 'Норма')
 
         rec   = max(0,round(avg_day*avail_K*am*(LEAD+SAFETY  )*season_K-eff)) if not is_sp and p_avail else 0
-        rec60 = max(0,round(avg_day*avail_K*am*(LEAD+SAFETY60)*season_K-eff)) if not is_sp and p_avail else 0
+        # знижка рівня 2 → 90 днів, рівня 1 → 60 днів, немає → 0
+        safety_disc = SAFETY90 if use_90 else (SAFETY60 if use_60 else 0)
+        rec60 = max(0,round(avg_day*avail_K*am*(LEAD+safety_disc)*season_K-eff)) if safety_disc else 0
         zero_date = (today+timedelta(days=int(dl))).strftime('%d.%m.%Y') if 0<=dl<999 else None
 
         row = dict(
@@ -287,7 +292,7 @@ def run_analysis(sheets, sheet_map, params):
             days_left=dl, zero_date=zero_date, status=st,
             is_sporadic=is_sp, sporadic_reason=reason,
             season_K=round(season_K,3), rec=rec, rec_60=rec60,
-            use_60=use_60, price_disc=round(p_disc,1),
+            use_60=use_60, use_90=use_90, safety_disc=safety_disc, price_disc=round(p_disc,1),
             buy_price=p_price, sell_price=round(sell_price,2) if sell_price else None,
             mi_day=mi_day, low_avail=avail_pct<LOW_AV,
         )
@@ -540,8 +545,11 @@ with st.sidebar:
     with st.expander("📅 Замовлення", expanded=True):
         lead    = st.slider("Lead time (дні)", 1, 30, 14)
         safety  = st.slider("Страховий запас (дні)", 7, 60, 30)
-        safety60= st.slider("Safety при знижці (дні)", 30, 90, 60)
-        disc_thr= st.slider("Поріг знижки постачальника (%)", 5, 30, 10)
+        st.markdown("**Знижки постачальника:**")
+        disc_thr = st.slider("Поріг знижки 1 (%)", 5, 39, 10, help="Знижка ≥ цього % → 60 днів запасу")
+        safety60 = st.slider("  Запас при знижці 1 (дні)", 30, 89, 60)
+        disc_thr2= st.slider("Поріг знижки 2 (%)", disc_thr+1, 70, 40, help="Знижка ≥ цього % → 90 днів запасу")
+        safety90 = st.slider("  Запас при знижці 2 (дні)", safety60+1, 120, 90)
 
     with st.expander("📊 Попит", expanded=True):
         min_months= st.slider("Мін. місяців з продажами", 2, 9, 6)
@@ -555,7 +563,8 @@ with st.sidebar:
                                 help="Більше λ = сильніший акцент на останні місяці")
 
 params = dict(mg_min=mg_min, mg_a=mg_a, a_mult=a_mult,
-              lead=lead, safety=safety, safety60=safety60, disc_thr=disc_thr,
+              lead=lead, safety=safety, safety60=safety60, safety90=safety90,
+              disc_thr=disc_thr, disc_thr2=disc_thr2,
               min_months=min_months, min_qty=min_qty, low_avail=low_avail,
               avail_alpha=avail_alpha, lambda_val=lambda_val)
 
@@ -636,10 +645,18 @@ if uploaded:
                 'Дні до 0':  r['days_left'] if r['days_left']<999 else '∞',
                 'Тренд':     r['trend'],
                 'Замовити 14+30':  r['rec'],
-                'Замовити 14+60':  r['rec_60'],
+                'Замовити (знижка)': (
+                    f"{r['rec_60']} шт ({r.get('safety_disc',60)}д)"
+                    if r.get('rec_60',0) > 0 else '—'),
+                'Знижка %': r.get('price_disc', 0) or '—',
             } for r in order])
             st.dataframe(df, use_container_width=True, height=500)
-            st.caption(f"Всього: {len(order)} SKU | {sum(r['rec'] for r in order)} шт (стандарт) | {sum(r['rec_60'] for r in order)} шт (при знижці)")
+            disc1=[r for r in order if r.get('rec_60',0)>0 and not r.get('use_90')]
+            disc2=[r for r in order if r.get('rec_60',0)>0 and r.get('use_90')]
+            st.caption(
+                f"Всього: {len(order)} SKU | стандарт: {sum(r['rec'] for r in order)} шт | "
+                f"знижка 1 ({params['safety60']}д): {sum(r.get('rec_60',0) for r in disc1)} шт / {len(disc1)} SKU | "
+                f"знижка 2 ({params.get('safety90',90)}д): {sum(r.get('rec_60',0) for r in disc2)} шт / {len(disc2)} SKU")
         else:
             st.success("Всі залишки в нормі — замовлення не потрібні")
 
