@@ -132,7 +132,7 @@ def run_analysis(sheets, sheet_map, params):
             if not r[0] or not str(r[0]).strip(): continue
             sku = str(r[0]).strip(); days = []
             for v in r[1:n+1]:
-                dv = float(v) if v is not None else 0.0
+                dv = safe_float(v) or 0.0
                 days.append(dv*30 if 0 < dv <= 1 else dv)
             avail_map[sku] = days
 
@@ -143,8 +143,8 @@ def run_analysis(sheets, sheet_map, params):
             if not r[0] or not str(r[0]).strip() or str(r[0])=='1*': continue
             sku = str(r[0]).strip()
             nm  = str(r[1]) if len(r)>1 and r[1] else ''
-            st  = max(float(r[3]),0) if len(r)>3 and r[3] is not None else 0
-            tr  = max(float(r[4]),0) if len(r)>4 and r[4] is not None else 0
+            st  = max(safe_float(r[3]) or 0, 0) if len(r)>3 else 0
+            tr  = max(safe_float(r[4]) or 0, 0) if len(r)>4 else 0
             stock_map[sku] = (st, tr, nm)
 
     # ── Ціни ──
@@ -174,8 +174,8 @@ def run_analysis(sheets, sheet_map, params):
         av   = avail_map.get(sku, [30]*n)
         md   = []
         for i,(ci,label) in enumerate(months):
-            qty  = float(r[ci])   if r[ci]   is not None else 0.0
-            rent = float(r[ci+1]) if len(r)>ci+1 and r[ci+1] is not None else None
+            qty  = safe_float(r[ci])   or 0.0 if r[ci]   is not None else 0.0
+            rent = safe_float(r[ci+1])         if len(r)>ci+1 and r[ci+1] is not None else None
             if rent is not None and 0 < rent < 1: rent *= 100
             ad   = av[i] if i < len(av) else 30
             inc  = (rent >= MG_MIN) if rent is not None else (qty > 0)
