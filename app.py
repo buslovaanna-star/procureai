@@ -546,10 +546,17 @@ with st.sidebar:
         lead    = st.slider("Lead time (дні)", 1, 30, 14)
         safety  = st.slider("Страховий запас (дні)", 7, 60, 30)
         st.markdown("**Знижки постачальника:**")
-        disc_thr = st.slider("Поріг знижки 1 (%)", 5, 39, 10, help="Знижка ≥ цього % → 60 днів запасу")
-        safety60 = st.slider("  Запас при знижці 1 (дні)", 30, 89, 60)
-        disc_thr2= st.slider("Поріг знижки 2 (%)", disc_thr+1, 70, 40, help="Знижка ≥ цього % → 90 днів запасу")
-        safety90 = st.slider("  Запас при знижці 2 (дні)", safety60+1, 120, 90)
+        disc_thr = st.slider("Поріг знижки 1 (%)", 5, 60, 10,
+                             help="Знижка ≥ цього % → замовити запас на N днів")
+        safety60 = st.slider("Запас при знижці 1 (дні)", 30, 90, 60)
+        disc_thr2= st.slider("Поріг знижки 2 (%)", 15, 70, 40,
+                             help="Знижка ≥ цього % → замовити більший запас")
+        safety90 = st.slider("Запас при знижці 2 (дні)", 60, 180, 90)
+        if disc_thr2 <= disc_thr:
+            st.warning(f"⚠️ Поріг 2 ({disc_thr2}%) має бути більше порогу 1 ({disc_thr}%)")
+            disc_thr2 = disc_thr + 1
+        if safety90 <= safety60:
+            safety90 = safety60 + 1
 
     with st.expander("📊 Попит", expanded=True):
         min_months= st.slider("Мін. місяців з продажами", 2, 9, 6)
