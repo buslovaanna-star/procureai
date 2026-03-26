@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import math
 import io
 from datetime import date, timedelta
@@ -29,6 +32,20 @@ def safe_float(v):
         f = float(str(v).replace(',','.').strip())
         return f if f > 0 else None
     except: return None
+
+def parse_discount(v):
+    """Парсить знижку: "Знижка 15 %", "15%", 0.15, 15 → повертає 0-100"""
+    if v is None: return 0
+    import re as _re
+    s = str(v).strip()
+    if not s or s in ('-', '', 'None'): return 0
+    nums = _re.findall(r'\d+[.,]?\d*', s)
+    if not nums: return 0
+    try:
+        val = float(nums[0].replace(',', '.'))
+        if val < 1: val *= 100
+        return round(val, 1) if val > 0 else 0
+    except: return 0
 
 def mo_num(label):
     return UA_MO.get(str(label).split()[0], 0)
@@ -160,7 +177,7 @@ def run_analysis(sheets, sheet_map, params):
             disc_raw  = r[5] if len(r)>5 else None
             sold30    = safe_float(r[8]) if len(r)>8 else None
             in_stock  = 'наявн' in avail_str or avail_str in ('1','true')
-            disc = safe_float(disc_raw) or 0
+            disc = parse_discount(disc_raw)
             price_map[sku] = (price, in_stock, disc, sold30)
 
     # ── Pass 1: season K ──
@@ -324,9 +341,6 @@ def run_analysis(sheets, sheet_map, params):
 # Генерація Excel-звіту
 # ─────────────────────────────────────────────
 def gen_excel(data, params):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
 
     results  = data['regular']
     sporadic = data['sporadic']
