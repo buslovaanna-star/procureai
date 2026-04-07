@@ -409,7 +409,7 @@ def gen_excel(data, params):
     COLS1 = [("SKU",13),("Назва",42),("ABC\nмарж%",7),("ABC\nMI",7),
              ("Маржа %",10),("MI/день",11),("Залишок+\nтранзит",10),
              ("Дата нуля",11),("Дні\nдо нуля",9),("Тренд",11),
-             ("Замовити\n14+30д",12),("Замовити\n(знижка)",13)]
+             ("Замовити\n14+30д",12),("Замовити 60д\n(знижка)",12),("Сума замовл.\n(грн)",14)]
     ws_init(ws1, f"ЗАМОВЛЕННЯ | {today.strftime('%d.%m.%Y')} | {p}",
             f"⚑ = наявність <{params['low_avail']}%. "
             f"Золото ABC_MI=A (топ 70% маржинального доходу/день).", COLS1)
@@ -423,9 +423,13 @@ def gen_excel(data, params):
         elif r['status']=='Норма': bg = C['row1'] if ri%2==0 else C['row2']
         tr = r.get('trend','—'); mi = r.get('mi_day'); abc_mi = r.get('abc_mi','?')
         sd_ = r.get('safety_disc',0)
+        buy_p = r.get('buy_price') or 0
+        qty_for_sum = r['rec_60'] if r['rec_60']>0 else r['rec']
+        order_sum = round(qty_for_sum * buy_p, 2) if qty_for_sum > 0 and buy_p > 0 else None
         vals = [r['sku'],r['name'],r['abc'],abc_mi,r['avg_margin'],mi,r['eff_stock'],
                 r.get('zero_date'),dl if dl<999 else None,tr,r['rec'],
-                f"{r['rec_60']} шт ({sd_}д)" if r['rec_60']>0 else "—"]
+                r['rec_60'] if r['rec_60']>0 else None,
+                order_sum]
         for col, val in enumerate(vals, 1):
             c = ws1.cell(row=row,column=col,value=val); c.fill=fl(bg); c.border=tb()
             if col==1:
@@ -457,11 +461,30 @@ def gen_excel(data, params):
                 else: c.value="—"; c.font=cf(sz=10,color="BBBBBB")
                 c.alignment=ca()
             elif col==12:
-                if r['rec_60']>0:
-                    c.font=Font(name="Arial",bold=True,size=11,color=C['amber']); c.fill=fl(C['amber_l'])
-                else: c.font=cf(sz=10,color="BBBBBB")
+                if val and val>0:
+                    c.font=Font(name="Arial",bold=True,size=12,color=C['amber'])
+                    c.fill=fl(C['amber_l'])
+                else:
+                    c.value="—"; c.font=cf(sz=10,color="BBBBBB")
+                c.alignment=ca()
+            elif col==13:
+                if val and val>0:
+                    c.number_format='#,##0.00'
+                    c.font=Font(name="Arial",bold=True,size=10,color=C['main'])
+                else:
+                    c.value="—"; c.font=cf(sz=10,color="BBBBBB")
+                c.alignment=ca()
                 c.alignment=ca()
     ws1.freeze_panes="A4"; ws1.auto_filter.ref=f"A3:{get_column_letter(len(COLS1))}{len(order)+3}"
+    # Підсумковий рядок суми
+    sr = len(order)+4
+    ws1.cell(row=sr,column=1,value="ВСЬОГО:").font=Font(name="Arial",bold=True,size=10,color=C['main'])
+    ws1.cell(row=sr,column=11,value=sum(r['rec'] for r in order)).font=Font(name="Arial",bold=True,size=12,color=C['main'])
+    td=sum(r['rec_60'] for r in order if r['rec_60']>0)
+    ws1.cell(row=sr,column=12,value=td if td else None).font=Font(name="Arial",bold=True,size=12,color=C['amber'])
+    ts_v=sum((r['rec_60'] if r['rec_60']>0 else r['rec'])*(r.get('buy_price') or 0) for r in order)
+    cs_v=ws1.cell(row=sr,column=13,value=round(ts_v,2) if ts_v>0 else None)
+    cs_v.font=Font(name="Arial",bold=True,size=12,color=C['main']); cs_v.number_format='#,##0.00' 
 
     # Sheet 2 — Аналіз SKU
     ws2 = wb.create_sheet("Аналіз SKU")
@@ -691,8 +714,8 @@ if f_template:
                 'Дні до 0':  r['days_left'] if r['days_left']<999 else '∞',
                 'Тренд':     r['trend'],
                 'Замовити 14+30': r['rec'],
-                'Замовити (знижка)': (f"{r['rec_60']} шт ({r.get('safety_disc',0)}д)"
-                                      if r.get('rec_60',0)>0 else '—'),
+                'Замовити 60д (знижка)': r['rec_60'] if r.get('rec_60',0)>0 else None,
+                'Сума замовл. (грн)': round((r['rec_60'] if r.get('rec_60',0)>0 else r['rec'])*(r.get('buy_price') or 0),2) if (r.get('buy_price') or 0)>0 else None,
                 'Знижка %':  r.get('price_disc',0) or '—',
             } for r in order])
             st.dataframe(df, use_container_width=True, height=500)
