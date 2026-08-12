@@ -4,8 +4,17 @@ import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import math, io, re
+import csv, math, io, re
 from datetime import date, timedelta
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from supplier_allocation import (
+    allocate_orders,
+    build_reference_price_map,
+    google_sheet_csv_url,
+    parse_supplier_prices,
+)
 
 st.set_page_config(
     page_title="ProcureAI — Аналіз закупівель",
@@ -55,6 +64,33 @@ def mo_year(label):
 @st.cache_data(show_spinner=False)
 def load_wb(file_bytes):
     return openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_google_sheet_prices(sheet_url, supplier_name):
+    """Read a public Google Sheet as CSV and reuse the normal price parser."""
+    export_url = google_sheet_csv_url(sheet_url)
+    request = Request(export_url, headers={"User-Agent": "ProcureAI/1.0"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = response.read()
+            content_type = response.headers.get("Content-Type", "")
+    except HTTPError as exc:
+        raise ValueError(f"Google Sheets повернув помилку HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise ValueError("Не вдалося підключитися до Google Sheets") from exc
+
+    text = payload.decode("utf-8-sig", errors="replace")
+    if "text/html" in content_type.lower() or text.lstrip().lower().startswith("<!doctype html"):
+        raise ValueError("Таблиця не опублікована для перегляду за посиланням")
+
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        raise ValueError("Google Sheet не містить даних")
+    workbook = Workbook(); worksheet = workbook.active
+    for row in rows:
+        worksheet.append(row)
+    return parse_supplier_prices(workbook, supplier_name)
 
 # ── Парсинг шаблону ───────────────────────────
 def parse_template(wb):
@@ -164,31 +200,9 @@ def parse_template(wb):
     return sku_data, months_labels, stock_map, avail_map, []
 
 # ── Парсинг файлу цін ─────────────────────────
-def parse_prices(wb):
-    """
-    iHerb Catalog: 1 вкладка, рядок 1 = заголовки
-    Артикул | Название | Цена | Стара ціна | Наличие | Скидка | Рейтинг | Відгуки | Продано за 30 дн | Ссылка
-    """
-    ws = wb[wb.sheetnames[0]]
-    price_map = {}
-    rows = list(ws.iter_rows(values_only=True))
-    # Знаходимо рядок заголовків
-    header_row = 0
-    for i, row in enumerate(rows[:5]):
-        cols = [cs(v).lower() for v in row if v]
-        if any('артикул' in c or 'sku' in c for c in cols):
-            header_row = i + 1
-            break
-    for row in rows[header_row:]:
-        if not row[0]: continue
-        sku = cs(row[0])
-        if not sku: continue
-        price     = sn(row[2]) if len(row) > 2 else None
-        avail_str = cs(row[4]).lower() if len(row) > 4 and row[4] else ''
-        in_stock  = 'наявн' in avail_str or avail_str in ('1', 'true', 'yes')
-        disc      = parse_disc(row[5]) if len(row) > 5 else 0
-        price_map[sku] = (price, in_stock, disc)
-    return price_map
+def parse_prices(wb, supplier_name="iHerb"):
+    """Compatibility wrapper around the configurable supplier price parser."""
+    return parse_supplier_prices(wb, supplier_name)
 
 # ── Основний аналіз ───────────────────────────
 def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, params):
@@ -307,7 +321,7 @@ def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, param
 
         # Ціни
         pi = price_map.get(sku)
-        p_avail = pi[1] if pi else True
+        p_avail = pi[1] if pi else False
         p_disc  = pi[2] if pi else 0
         p_price = pi[0] if pi else None
         use_60  = not is_sp and p_avail and p_disc >= DISC_THR
@@ -315,7 +329,7 @@ def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, param
         safety_disc = SAFETY90 if use_90 else (SAFETY60 if use_60 else 0)
 
         # Маржинальний дохід
-        mi_day = None
+        mi_day = None; sell_price = None
         if p_price and avg_margin and 0 < avg_margin < 100:
             sell_price = p_price / (1 - avg_margin/100)
             mi_day = round(avg_day * (sell_price - p_price), 4)
@@ -323,7 +337,9 @@ def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, param
         dl = round(stock/avg_day) if avg_day > 0 else 999
         st2 = ('Критично' if dl<5 else 'Низько' if dl<15
                else 'Надлишок' if dl>90 else 'Норма')
-        rec   = max(0,round(avg_day*avail_K*am*(LEAD+SAFETY  )*season_K-eff)) if not is_sp and p_avail else 0
+        # Потреба залежить від попиту, а не від наявності в конкретного постачальника.
+        # Відсутні пропозиції потраплять у список нерозподілених SKU після алокації.
+        rec   = max(0,round(avg_day*avail_K*am*(LEAD+SAFETY  )*season_K-eff)) if not is_sp else 0
         rec60 = max(0,round(avg_day*avail_K*am*(LEAD+safety_disc)*season_K-eff)) if safety_disc else 0
         zero_date = (today+timedelta(days=int(dl))).strftime('%d.%m.%Y') if 0<=dl<999 else None
 
@@ -336,7 +352,7 @@ def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, param
             is_sporadic=is_sp, sporadic_reason=reason,
             season_K=round(season_K,3), rec=rec, rec_60=rec60,
             use_60=use_60, use_90=use_90, safety_disc=safety_disc,
-            price_disc=round(p_disc,1), buy_price=p_price,
+            price_disc=round(p_disc,1), buy_price=p_price, sell_price=sell_price,
             mi_day=mi_day, low_avail=avail_pct < LOW_AV,
         )
         if is_sp: sporadic.append(row_d)
@@ -404,13 +420,13 @@ def gen_excel(data, params):
             ws.column_dimensions[get_column_letter(col)].width=w
         ws.row_dimensions[3].height=40
 
-    # Sheet 1 — Замовлення
-    ws1 = wb.active; ws1.title = "Замовлення"
+    # Sheet 1 — загальна потреба до розподілу
+    ws1 = wb.active; ws1.title = "Загальна потреба"
     COLS1 = [("SKU",13),("Назва",42),("ABC\nмарж%",7),("ABC\nMI",7),
              ("Маржа %",10),("MI/день",11),("Залишок+\nтранзит",10),
              ("Дата нуля",11),("Дні\nдо нуля",9),("Тренд",11),
              ("Замовити\n14+30д",12),("Замовити 60д\n(знижка)",12),("Сума замовл.\n(грн)",14)]
-    ws_init(ws1, f"ЗАМОВЛЕННЯ | {today.strftime('%d.%m.%Y')} | {p}",
+    ws_init(ws1, f"ЗАГАЛЬНА ПОТРЕБА | {today.strftime('%d.%m.%Y')} | {p}",
             f"⚑ = наявність <{params['low_avail']}%. "
             f"Золото ABC_MI=A (топ 70% маржинального доходу/день).", COLS1)
 
@@ -591,12 +607,85 @@ def gen_excel(data, params):
             elif col==6: c.font=Font(name="Arial",size=10,italic=True,color=C['orange']); c.alignment=la()
             else: c.font=cf(sz=10); c.alignment=ca()
 
+    # Окремі замовлення постачальникам
+    supplier_orders = data.get('supplier_orders', {})
+    supplier_configs = data.get('supplier_configs', [])
+    supplier_cols = [
+        ("SKU",13),("Назва",42),("Кількість",11),("Ціна прайсу",13),
+        ("Ціна з кориг.",14),("Сума",14),("Знижка %",10),("Маржа %",10),
+        ("Lead time",10),("Дні до 0",10),
+    ]
+    used_sheet_names = set(wb.sheetnames)
+    for supplier_index, supplier_config in enumerate(supplier_configs, 1):
+        supplier = supplier_config['name']
+        lines = supplier_orders.get(supplier, [])
+        raw_name = re.sub(r'[\\/*?:\[\]]', '_', f"Замовл {supplier_index} {supplier}")[:31]
+        sheet_name = raw_name or f"Замовлення {supplier_index}"
+        suffix = 2
+        while sheet_name in used_sheet_names:
+            sheet_name = f"{raw_name[:28]} {suffix}"[:31]
+            suffix += 1
+        used_sheet_names.add(sheet_name)
+        ws_supplier = wb.create_sheet(sheet_name)
+        ws_init(
+            ws_supplier,
+            f"ЗАМОВЛЕННЯ — {supplier} | {today.strftime('%d.%m.%Y')}",
+            f"SKU: {len(lines)} | Кількість: {sum(line['quantity'] for line in lines)} | "
+            f"Сума: {sum(line['order_value'] for line in lines):,.2f}",
+            supplier_cols,
+        )
+        for row_index, line in enumerate(lines, 4):
+            values = [
+                line['sku'], line['name'], line['quantity'], line['unit_price'],
+                line['landed_unit_price'], line['order_value'], line['discount_pct'],
+                line['margin_pct'], line['lead_time_days'], line['days_left'],
+            ]
+            for column_index, value in enumerate(values, 1):
+                cell = ws_supplier.cell(row=row_index, column=column_index, value=value)
+                cell.fill = fl(C['row1'] if row_index % 2 == 0 else C['white'])
+                cell.border = tb(); cell.font = cf(bold=column_index in (1,3,6), sz=10)
+                cell.alignment = la() if column_index in (1,2) else ca()
+                if column_index in (4,5,6): cell.number_format = '#,##0.00'
+                if column_index in (7,8) and value is not None: cell.number_format = '0.0"%"'
+        total_row = len(lines) + 4
+        ws_supplier.cell(total_row, 1, "ВСЬОГО").font = hf(C['main'], sz=10)
+        ws_supplier.cell(total_row, 3, sum(line['quantity'] for line in lines)).font = hf(C['main'], sz=10)
+        total_cell = ws_supplier.cell(total_row, 6, round(sum(line['order_value'] for line in lines), 2))
+        total_cell.font = hf(C['main'], sz=10); total_cell.number_format = '#,##0.00'
+        ws_supplier.freeze_panes = "A4"
+        ws_supplier.auto_filter.ref = f"A3:J{max(3, len(lines)+3)}"
+
+    # SKU, які не вдалося замовити в жодного постачальника
+    unallocated = data.get('unallocated', [])
+    ws_unallocated = wb.create_sheet("Нерозподілені SKU")
+    unallocated_cols = [
+        ("SKU",13),("Назва",42),("Потрібно",11),("Не розподілено",15),
+        ("Дні до 0",10),("Причина",48),
+    ]
+    ws_init(
+        ws_unallocated,
+        f"Нерозподілені SKU — {len(unallocated)}",
+        "Перевірте наявність, ціну, MOQ, ліміти, lead time та мінімальну маржу.",
+        unallocated_cols,
+        "880E4F", "FCE4EC",
+    )
+    for row_index, line in enumerate(unallocated, 4):
+        values = [line['sku'], line['name'], line['requested_qty'], line['unallocated_qty'],
+                  line['days_left'], line['reason']]
+        for column_index, value in enumerate(values, 1):
+            cell = ws_unallocated.cell(row=row_index, column=column_index, value=value)
+            cell.fill = fl(C['low_l'] if row_index % 2 == 0 else C['white'])
+            cell.border = tb(); cell.font = cf(bold=column_index in (1,4), sz=10)
+            cell.alignment = la() if column_index in (1,2,6) else ca()
+    ws_unallocated.freeze_panes = "A4"
+    ws_unallocated.auto_filter.ref = f"A3:F{max(3, len(unallocated)+3)}"
+
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
 
 # ── UI ───────────────────────────────────────
 st.title("📦 ProcureAI — Аналіз закупівель")
-st.caption("Файл 1: Шаблон (продажі + наявність + залишки) | Файл 2: Ціни iHerb")
+st.caption("Шаблон продажів + два незалежні прайси → два замовлення постачальникам")
 
 with st.sidebar:
     st.header("⚙️ Параметри")
@@ -624,24 +713,104 @@ with st.sidebar:
         lambda_val  = st.slider("Часові ваги λ", 0.05, 0.5, 0.25, 0.05,
                                 help="Більше λ = більша вага останніх місяців")
 
+    with st.expander("⚖️ Правила вибору постачальника", expanded=True):
+        strategy_label = st.selectbox(
+            "Стратегія",
+            ["Пріоритет у межах допуску", "Найнижча ціна", "Баланс ціни та строку"],
+            help="Пріоритет: обирає бажаного постачальника, якщо він не дорожчий за допустимий відсоток.",
+        )
+        strategy = {
+            "Пріоритет у межах допуску": "priority_within_tolerance",
+            "Найнижча ціна": "lowest_price",
+            "Баланс ціни та строку": "balanced",
+        }[strategy_label]
+        price_tolerance = st.slider("Допустима різниця ціни (%)", 0, 30, 5)
+        min_purchase_margin = st.slider("Мін. маржа після вибору прайсу (%)", 0, 60, 0)
+        max_supplier_lead = st.slider("Макс. lead time постачальника (дні, 0 = без межі)", 0, 120, 0)
+
+    with st.expander("🏪 Постачальник 1", expanded=False):
+        supplier_1_name = st.text_input("Назва", "iHerb", key="supplier_1_name")
+        supplier_1_priority = st.number_input("Пріоритет", 1, 10, 1, key="supplier_1_priority")
+        supplier_1_lead = st.number_input("Lead time (дні)", 0, 180, int(lead), key="supplier_1_lead")
+        supplier_1_adjustment = st.number_input(
+            "Коригування ціни: доставка/мито (%)", -50.0, 200.0, 0.0, 0.5, key="supplier_1_adjustment")
+        supplier_1_moq = st.number_input("MOQ за SKU (шт)", 1, 10000, 1, key="supplier_1_moq")
+        supplier_1_min_value = st.number_input(
+            "Мінімальна сума замовлення (0 = немає)", 0.0, 100000000.0, 0.0, 100.0, key="supplier_1_min_value")
+        supplier_1_limit = st.number_input(
+            "Ліміт замовлення (0 = без ліміту)", 0.0, 100000000.0, 0.0, 100.0, key="supplier_1_limit")
+
+    with st.expander("🏬 Постачальник 2", expanded=False):
+        supplier_2_name = st.text_input("Назва", "Постачальник 2", key="supplier_2_name")
+        supplier_2_source = st.selectbox(
+            "Джерело прайсу", ["Google Sheets (автоматично)", "Excel-файл"],
+            key="supplier_2_source")
+        supplier_2_google_url = st.text_input(
+            "Посилання Google Sheets",
+            "https://docs.google.com/spreadsheets/d/1k0hGCK2LbgnzaYkqCuj7QXXRdDbdbvjbGhK9OjZGvG8/edit?gid=0#gid=0",
+            key="supplier_2_google_url",
+            help="Таблиця повинна мати доступ: усі, хто має посилання — читач.")
+        supplier_2_priority = st.number_input("Пріоритет", 1, 10, 2, key="supplier_2_priority")
+        supplier_2_lead = st.number_input("Lead time (дні)", 0, 180, 7, key="supplier_2_lead")
+        supplier_2_adjustment = st.number_input(
+            "Коригування ціни: доставка/мито (%)", -50.0, 200.0, 0.0, 0.5, key="supplier_2_adjustment")
+        supplier_2_moq = st.number_input("MOQ за SKU (шт)", 1, 10000, 1, key="supplier_2_moq")
+        supplier_2_min_value = st.number_input(
+            "Мінімальна сума замовлення (0 = немає)", 0.0, 100000000.0, 0.0, 100.0, key="supplier_2_min_value")
+        supplier_2_limit = st.number_input(
+            "Ліміт замовлення (0 = без ліміту)", 0.0, 100000000.0, 0.0, 100.0, key="supplier_2_limit")
+
 params = dict(mg_min=mg_min, mg_a=mg_a, a_mult=a_mult,
               lead=lead, safety=safety, safety60=safety60, safety90=safety90,
               disc_thr=disc_thr, disc_thr2=disc_thr2,
               min_months=min_months, min_qty=min_qty, low_avail=low_avail,
               avail_alpha=avail_alpha, lambda_val=lambda_val)
 
+if supplier_2_name.strip() == supplier_1_name.strip():
+    supplier_2_name = f"{supplier_2_name.strip()} 2"
+
+supplier_configs = [
+    dict(name=supplier_1_name.strip() or "iHerb", priority=supplier_1_priority,
+         lead_time_days=supplier_1_lead, price_adjustment_pct=supplier_1_adjustment,
+         min_order_qty=supplier_1_moq, min_order_value=supplier_1_min_value,
+         order_limit_value=supplier_1_limit),
+    dict(name=supplier_2_name.strip() or "Постачальник 2", priority=supplier_2_priority,
+         lead_time_days=supplier_2_lead, price_adjustment_pct=supplier_2_adjustment,
+         min_order_qty=supplier_2_moq, min_order_value=supplier_2_min_value,
+         order_limit_value=supplier_2_limit),
+]
+allocation_rules = dict(
+    strategy=strategy,
+    price_tolerance_pct=price_tolerance,
+    min_purchase_margin_pct=min_purchase_margin,
+    max_lead_time_days=max_supplier_lead,
+    price_weight=0.7,
+    lead_time_weight=0.2,
+)
+
 # ── Завантаження файлів ──
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
     f_template = st.file_uploader(
         "📋 **Файл 1 — Шаблон**",
         type=["xlsx","xls"], key="template",
         help="Вкладки: 'продажі дані', 'наявність на складі', 'Залишки'")
 with col2:
-    f_prices = st.file_uploader(
-        "💰 **Файл 2 — Ціни iHerb**",
-        type=["xlsx","xls"], key="prices",
-        help="iHerb Catalog з колонками: Артикул, Цена, Наличие, Скидка")
+    f_prices_1 = st.file_uploader(
+        f"💰 **Прайс — {supplier_configs[0]['name']}**",
+        type=["xlsx","xls"], key="prices_1",
+        help="Обов'язкові колонки: SKU/Артикул і Ціна. Порядок колонок довільний.")
+with col3:
+    if supplier_2_source == "Excel-файл":
+        f_prices_2 = st.file_uploader(
+            f"💰 **Прайс — {supplier_configs[1]['name']}**",
+            type=["xlsx","xls"], key="prices_2",
+            help="Підтримуються Наявність, Доступна кількість, Знижка, Lead time та MOQ.")
+    else:
+        f_prices_2 = None
+        st.info(f"🔄 {supplier_configs[1]['name']}: прайс читається з Google Sheets кожні 5 хвилин")
+        if st.button("Оновити онлайн-прайс зараз", use_container_width=True):
+            load_google_sheet_prices.clear()
 
 if f_template:
     with st.spinner("Читаємо шаблон..."):
@@ -652,15 +821,42 @@ if f_template:
         for e in errors: st.error(e)
         st.stop()
 
-    price_map = {}
-    if f_prices:
-        with st.spinner("Читаємо ціни..."):
-            wb_p = load_wb(f_prices.read())
-            price_map = parse_prices(wb_p)
-        st.success(f"✅ Ціни завантажено: {len(price_map)} SKU, "
-                   f"зі знижкою: {sum(1 for v in price_map.values() if v[2]>0)}")
-    else:
-        st.info("💡 Файл цін не завантажено — колонка знижки буде порожньою")
+    price_maps = {supplier_configs[0]['name']: {}, supplier_configs[1]['name']: {}}
+
+    def show_price_result(supplier_name, offers, price_warnings, source_label):
+        price_maps[supplier_name] = offers
+        st.success(
+            f"✅ {supplier_name} ({source_label}): {len(offers)} SKU, "
+            f"в наявності {sum(1 for offer in offers.values() if offer['in_stock'])}")
+        for warning in price_warnings:
+            st.warning(warning)
+
+    if f_prices_1:
+        with st.spinner(f"Читаємо прайс: {supplier_configs[0]['name']}..."):
+            wb_p = load_wb(f_prices_1.read())
+            offers, price_warnings = parse_prices(wb_p, supplier_configs[0]['name'])
+        show_price_result(supplier_configs[0]['name'], offers, price_warnings, "Excel")
+
+    if supplier_2_source == "Google Sheets (автоматично)":
+        try:
+            with st.spinner(f"Оновлюємо онлайн-прайс: {supplier_configs[1]['name']}..."):
+                offers, price_warnings = load_google_sheet_prices(
+                    supplier_2_google_url, supplier_configs[1]['name'])
+            show_price_result(supplier_configs[1]['name'], offers, price_warnings, "Google Sheets")
+        except ValueError as exc:
+            st.error(f"❌ Не вдалося прочитати онлайн-прайс: {exc}")
+            st.caption("У Google Sheets встановіть доступ: Усі, хто має посилання → Читач.")
+    elif f_prices_2:
+        with st.spinner(f"Читаємо прайс: {supplier_configs[1]['name']}..."):
+            wb_p = load_wb(f_prices_2.read())
+            offers, price_warnings = parse_prices(wb_p, supplier_configs[1]['name'])
+        show_price_result(supplier_configs[1]['name'], offers, price_warnings, "Excel")
+    if not any(price_maps.values()):
+        st.info("💡 Прайси не завантажено — потреба буде розрахована, але SKU залишаться нерозподіленими")
+
+    # Для прогнозу ціни/знижки потрібна одна референсна пропозиція; фактичний
+    # постачальник визначається окремим алгоритмом нижче.
+    price_map = build_reference_price_map(price_maps)
 
     # Зведення по вкладках
     with st.expander("🔍 Статистика завантажених даних", expanded=False):
@@ -673,6 +869,23 @@ if f_template:
 
     with st.spinner("Аналізуємо..."):
         data = run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, params)
+
+    demand_lines = [
+        dict(
+            sku=row['sku'], name=row['name'], days_left=row['days_left'],
+            order_qty=row['rec_60'] if row.get('rec_60', 0) > 0 else row['rec'],
+            sell_price=row.get('sell_price'),
+        )
+        for row in data['regular']
+        if row['rec'] > 0 or row.get('rec_60', 0) > 0
+    ]
+    allocation = allocate_orders(demand_lines, price_maps, supplier_configs, allocation_rules)
+    data['supplier_orders'] = allocation['orders']
+    data['supplier_summary'] = allocation['summary']
+    data['unallocated'] = allocation['unallocated']
+    data['excluded_suppliers'] = allocation['excluded_suppliers']
+    data['supplier_configs'] = supplier_configs
+    data['allocation_rules'] = allocation_rules
 
     meta     = data['meta']
     regular  = data['regular']
@@ -687,8 +900,8 @@ if f_template:
     c2.metric("Постійний попит", len(regular))
     c3.metric("Разовий попит", len(sporadic))
     c4.metric("Критично (<5дн)", sum(1 for r in regular if r['status']=='Критично'))
-    c5.metric("До замовлення", sum(1 for r in regular if r['rec']>0))
-    c6.metric("Season K", f"{meta['season_K']:.3f}")
+    c5.metric("Розподілено, шт", sum(v['quantity'] for v in data['supplier_summary'].values()))
+    c6.metric("Нерозподілено SKU", len(data['unallocated']))
 
     st.subheader("📅 Дата нуля залишків")
     buckets = [("🔴 Вже 0",0,1),("🔴 1-7 дн",1,8),("🟡 8-14 дн",8,15),
@@ -697,9 +910,57 @@ if f_template:
     for i,(lbl,lo,hi) in enumerate(buckets):
         cols_b[i].metric(lbl, sum(1 for r in regular if lo<=r['days_left']<hi))
 
-    tab1,tab2,tab3,tab4 = st.tabs(["🛒 Замовлення","📋 Аналіз SKU","⚠️ Ручне рішення","📦 Разовий попит"])
+    tab1,tab2,tab3,tab4,tab5 = st.tabs([
+        "🏪 Розподіл", "🛒 Загальна потреба", "📋 Аналіз SKU",
+        "⚠️ Ручне рішення", "📦 Разовий попит",
+    ])
 
     with tab1:
+        if data['supplier_summary']:
+            summary_cols = st.columns(len(data['supplier_summary']))
+            for index, (supplier, summary) in enumerate(data['supplier_summary'].items()):
+                summary_cols[index].metric(
+                    supplier,
+                    f"{summary['quantity']} шт",
+                    f"{summary['sku_count']} SKU · {summary['order_value']:,.2f}",
+                )
+        for supplier in [item['name'] for item in supplier_configs]:
+            lines = data['supplier_orders'].get(supplier, [])
+            st.markdown(f"#### {supplier}")
+            if not lines:
+                st.info("Немає позицій для цього постачальника")
+                continue
+            supplier_df = pd.DataFrame([{
+                'SKU': line['sku'],
+                'Назва': line['name'][:60],
+                'Кількість': line['quantity'],
+                'Ціна прайсу': line['unit_price'],
+                'Ціна з коригуванням': line['landed_unit_price'],
+                'Сума': line['order_value'],
+                'Маржа %': line['margin_pct'],
+                'Lead time': line['lead_time_days'],
+                'Дні до 0': line['days_left'],
+            } for line in lines])
+            st.dataframe(supplier_df, use_container_width=True, hide_index=True)
+
+        if data['excluded_suppliers']:
+            for excluded in data['excluded_suppliers']:
+                st.warning(
+                    f"{excluded['supplier']} виключено: сума {excluded['order_value']:,.2f} "
+                    f"менша за мінімальне замовлення {excluded['min_order_value']:,.2f}")
+
+        if data['unallocated']:
+            st.markdown("#### ⚠️ Нерозподілені SKU")
+            unallocated_df = pd.DataFrame([{
+                'SKU': line['sku'], 'Назва': line['name'][:60],
+                'Потрібно': line['requested_qty'], 'Не розподілено': line['unallocated_qty'],
+                'Дні до 0': line['days_left'], 'Причина': line['reason'],
+            } for line in data['unallocated']])
+            st.dataframe(unallocated_df, use_container_width=True, hide_index=True)
+        elif demand_lines:
+            st.success("Усю потребу розподілено між постачальниками")
+
+    with tab2:
         order = sorted([r for r in regular if r['rec']>0 or r['rec_60']>0],
                        key=lambda x: x['days_left'])
         if order:
@@ -728,7 +989,7 @@ if f_template:
         else:
             st.success("Всі залишки в нормі — замовлення не потрібні")
 
-    with tab2:
+    with tab3:
         df2 = pd.DataFrame([{
             'SKU':       ('⚑ ' if r['low_avail'] else '')+r['sku'],
             'Назва':     r['name'][:50],
@@ -747,7 +1008,7 @@ if f_template:
         } for r in sorted(regular, key=lambda x: x['days_left'])])
         st.dataframe(df2, use_container_width=True, height=500)
 
-    with tab3:
+    with tab4:
         low_rows = sorted([r for r in regular if r.get('low_avail')], key=lambda x: x['avail_pct'])
         if low_rows:
             df3 = pd.DataFrame([{'SKU':r['sku'],'Назва':r['name'][:50],'ABC':r['abc'],
@@ -759,7 +1020,7 @@ if f_template:
         else:
             st.success("Немає SKU з низькою наявністю")
 
-    with tab4:
+    with tab5:
         if sporadic:
             df4 = pd.DataFrame([{'SKU':r['sku'],'Назва':r['name'][:50],
                                   'Маржа %':r.get('avg_margin'),'Причина':r.get('sporadic_reason','')}
@@ -773,7 +1034,7 @@ if f_template:
     with st.spinner("Генеруємо Excel..."):
         excel_buf = gen_excel(data, params)
     st.download_button(
-        "📥 Завантажити Excel-звіт (4 вкладки)",
+        "📥 Завантажити Excel-звіт з двома замовленнями",
         data=excel_buf,
         file_name=f"ProcureAI_{date.today().strftime('%d%m%Y')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -790,6 +1051,8 @@ else:
 | `наявність на складі` | Номенклатура | Артикул | Залишок | Замовлено у постачальників |
 | `Залишки` | Блоки по 4 колонки на місяць: Артикул | Назва | Дні на складі | _ |
 
-**Файл 2 — Ціни iHerb** (оновлюєте за потреби):
-Артикул | Название | Цена | Старая цена | Наличие | Скидка | ...
+**Прайси постачальників 1 і 2** (окремі файли Excel):
+- Обов'язково: `SKU`/`Артикул` та `Ціна`/`Цена`/`Price`
+- Необов'язково: `Назва`, `Наявність`, `Доступна кількість`, `Знижка`, `Lead time`, `MOQ`
+- Порядок колонок довільний; старий формат каталогу iHerb також підтримується.
         """)
