@@ -528,6 +528,117 @@ def _allocate_once(
     return {"orders": orders, "unallocated": unallocated, "supplier_spend": supplier_spend}
 
 
+def _allocate_secondary_first(
+    demand_lines: list[dict],
+    price_maps: dict[str, dict[str, dict]],
+    supplier_configs: list[dict],
+    rules: dict,
+    allow_secondary: bool = True,
+) -> dict:
+    """Buy every eligible item from supplier 2 and send all remainder to supplier 1.
+
+    Supplier 1 is the guaranteed order channel: a missing row in its price list means
+    only that the price is unknown, not that the product cannot be ordered.
+    """
+
+    parsed_configs = [SupplierConfig.from_mapping(item) for item in supplier_configs]
+    if not parsed_configs:
+        return {"orders": {}, "unallocated": [], "summary": {}, "excluded_suppliers": []}
+    primary = parsed_configs[0]
+    secondary = parsed_configs[1] if len(parsed_configs) > 1 else None
+    orders = {config.name: [] for config in parsed_configs}
+    secondary_spend = 0.0
+    secondary_used: dict[str, float] = {}
+    max_lead = float(rules.get("max_lead_time_days", 0) or 0)
+    min_margin = float(rules.get("min_purchase_margin_pct", 0) or 0)
+
+    def order_line(supplier: str, line: dict, offer: dict | None, config: SupplierConfig,
+                   quantity: int, reason: str) -> dict:
+        price_known = bool(offer and safe_number(offer.get("price")) and safe_number(offer.get("price")) > 0)
+        unit_price = round(float(offer["price"]), 4) if price_known else None
+        landed_price = _landed_price(offer, config) if price_known else None
+        value = round(quantity * landed_price, 2) if landed_price is not None else 0.0
+        return {
+            "supplier": supplier,
+            "sku": clean_text(line.get("sku")),
+            "supplier_sku": offer.get("supplier_sku", clean_text(line.get("sku"))) if offer else clean_text(line.get("sku")),
+            "barcode": offer.get("barcode", "") if offer else "",
+            "name": clean_text(line.get("name")),
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "landed_unit_price": round(landed_price, 4) if landed_price is not None else None,
+            "order_value": value,
+            "discount_pct": offer.get("discount_pct", 0) if offer else 0,
+            "lead_time_days": float(offer.get("lead_time_days") or config.lead_time_days) if offer else config.lead_time_days,
+            "margin_pct": _margin_pct(line.get("sell_price"), landed_price) if landed_price is not None else None,
+            "days_left": line.get("days_left"),
+            "price_known": price_known,
+            "selection_reason": reason,
+        }
+
+    for line in sorted(demand_lines, key=lambda item: (item.get("days_left", 999), clean_text(item.get("sku")))):
+        sku = clean_text(line.get("sku"))
+        requested = math.floor(max(0.0, float(line.get("order_qty", 0) or 0)) + 1e-9)
+        if not sku or requested <= 0:
+            continue
+        secondary_qty = 0
+        secondary_offer = price_maps.get(secondary.name, {}).get(sku) if secondary and allow_secondary else None
+        if secondary_offer and secondary_offer.get("in_stock", False):
+            landed = _landed_price(secondary_offer, secondary)
+            lead_time = float(secondary_offer.get("lead_time_days") or secondary.lead_time_days)
+            margin = _margin_pct(line.get("sell_price"), landed)
+            moq = max(float(secondary_offer.get("min_order_qty") or 0), secondary.min_order_qty)
+            eligible = (not max_lead or lead_time <= max_lead) and (margin is None or margin >= min_margin)
+            if eligible and requested >= moq:
+                available = secondary_offer.get("available_qty")
+                secondary_qty = requested if available is None else min(
+                    requested, math.floor(max(0.0, float(available) - secondary_used.get(sku, 0)) + 1e-9))
+                if secondary.order_limit_value:
+                    budget_left = max(0.0, secondary.order_limit_value - secondary_spend)
+                    secondary_qty = min(secondary_qty, math.floor(budget_left / landed + 1e-9))
+                if secondary_qty < moq:
+                    secondary_qty = 0
+
+        if secondary_qty > 0 and secondary and secondary_offer:
+            item = order_line(
+                secondary.name, line, secondary_offer, secondary, secondary_qty,
+                "Є в доступному прайсі ДСН",
+            )
+            orders[secondary.name].append(item)
+            secondary_spend += item["order_value"]
+            secondary_used[sku] = secondary_used.get(sku, 0) + secondary_qty
+
+        remainder = requested - secondary_qty
+        if remainder > 0:
+            primary_offer = price_maps.get(primary.name, {}).get(sku)
+            reason = "Залишок після ДСН — замовити в iHerb"
+            if primary_offer is None:
+                reason = "Немає ціни в прайсі iHerb, але товар включено в замовлення"
+            orders[primary.name].append(order_line(
+                primary.name, line, primary_offer, primary, remainder, reason))
+
+    # If the DSN minimum total is not reached, move its whole order to iHerb.
+    if secondary and allow_secondary and orders.get(secondary.name) and secondary.min_order_value > secondary_spend:
+        rerun = _allocate_secondary_first(demand_lines, price_maps, supplier_configs, rules, allow_secondary=False)
+        rerun["excluded_suppliers"] = [{
+            "supplier": secondary.name,
+            "order_value": round(secondary_spend, 2),
+            "min_order_value": secondary.min_order_value,
+        }]
+        return rerun
+
+    summary = {}
+    for supplier, lines in orders.items():
+        if lines:
+            summary[supplier] = {
+                "sku_count": len(lines),
+                "quantity": sum(item["quantity"] for item in lines),
+                "order_value": round(sum(item["order_value"] for item in lines), 2),
+                "unknown_price_sku": sum(not item.get("price_known", True) for item in lines),
+            }
+    return {"orders": orders, "unallocated": [], "summary": summary, "excluded_suppliers": []}
+
+
 def allocate_orders(
     demand_lines: list[dict],
     price_maps: dict[str, dict[str, dict]],
@@ -541,6 +652,8 @@ def allocate_orders(
     """
 
     rules = dict(rules or {})
+    if rules.get("strategy") == "secondary_first_primary_fallback":
+        return _allocate_secondary_first(demand_lines, price_maps, supplier_configs, rules)
     configs = {cfg.name: cfg for cfg in (SupplierConfig.from_mapping(item) for item in supplier_configs)}
     active = {name for name, config in configs.items() if config.enabled and name in price_maps}
     if not active:

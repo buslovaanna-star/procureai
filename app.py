@@ -10,14 +10,117 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from supplier_allocation import (
-    apply_barcode_mapping,
-    allocate_orders,
-    build_reference_price_map,
-    google_sheet_csv_url,
-    parse_barcode_mapping_rows,
-    parse_supplier_prices,
-)
+import supplier_allocation as supplier_logic
+
+allocate_orders = supplier_logic.allocate_orders
+build_reference_price_map = supplier_logic.build_reference_price_map
+google_sheet_csv_url = supplier_logic.google_sheet_csv_url
+_supplier_price_parser = supplier_logic.parse_supplier_prices
+
+# Compatibility with an older supplier_allocation.py that may still be cached on
+# Streamlit Cloud. The current module provides these functions directly; the local
+# versions keep app.py importable while the second file is being refreshed.
+def _normalise_product_code(value):
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        return str(int(value)) if value.is_integer() else format(value, "f").rstrip("0").rstrip(".")
+    text = str(value).replace("\xa0", " ").strip().strip("'\"")
+    text = re.sub(r"\s+", "", text)
+    return text[:-2] if re.fullmatch(r"[+-]?\d+\.0", text) else text
+
+
+def _fallback_parse_barcode_mapping_rows(rows):
+    values = [tuple(row) for row in rows]
+    article_col = barcode_col = header_index = None
+    for row_index, row in enumerate(values[:10]):
+        for col_index, value in enumerate(row):
+            header = re.sub(r"\s+", " ", str(value or "").strip().lower().replace("_", " "))
+            if header in ("артикул", "sku", "код товару", "код товара", "article"):
+                article_col = col_index
+            if header in ("штрихкод", "штрих-код", "штрих код", "barcode", "ean", "upc"):
+                barcode_col = col_index
+        if article_col is not None and barcode_col is not None:
+            header_index = row_index
+            break
+    if header_index is None:
+        return {}, {"error": "Не знайдено колонки «Артикул» і «Штрихкод»"}
+    mapping = {}; conflicts = []; article_barcodes = {}; empty_rows = 0; valid_pairs = 0
+    for row in values[header_index + 1:]:
+        article = str(row[article_col] or "").strip() if article_col < len(row) else ""
+        barcode = _normalise_product_code(row[barcode_col] if barcode_col < len(row) else None)
+        if not article or not barcode:
+            empty_rows += 1; continue
+        if barcode in mapping and mapping[barcode] != article:
+            conflicts.append({"barcode": barcode, "articles": sorted({mapping[barcode], article})})
+            continue
+        mapping[barcode] = article
+        article_barcodes.setdefault(article, set()).add(barcode)
+        valid_pairs += 1
+    return mapping, {
+        "total_rows": max(0, len(values) - header_index - 1), "valid_pairs": valid_pairs,
+        "unique_barcodes": len(mapping), "unique_articles": len(article_barcodes),
+        "articles_with_multiple_barcodes": sum(len(codes) > 1 for codes in article_barcodes.values()),
+        "empty_rows": empty_rows, "conflicts": conflicts, "error": "",
+    }
+
+
+def _fallback_apply_barcode_mapping(offers, barcode_map):
+    remapped = {}; mapped = 0; direct = 0; unknown = []; duplicates = []
+    for source_code, source_offer in offers.items():
+        code = _normalise_product_code(source_code)
+        article = barcode_map.get(code)
+        if article:
+            mapped += 1
+        elif re.search(r"[A-Za-zА-Яа-яІіЇїЄє]", code):
+            article = str(source_code).strip(); direct += 1
+        else:
+            unknown.append(code); continue
+        offer = dict(source_offer, sku=article, supplier_sku=str(source_code).strip(),
+                     barcode=code if code in barcode_map else "")
+        if article in remapped:
+            duplicates.append({"article": article, "supplier_codes": [remapped[article].get("supplier_sku", ""), offer["supplier_sku"]]})
+            offer = min([remapped[article], offer], key=lambda item: (0 if item.get("in_stock") else 1, item.get("price", math.inf), -(item.get("available_qty") or 0)))
+        remapped[article] = offer
+    return remapped, {"source_offers": len(offers), "mapped_by_barcode": mapped, "direct_sku": direct,
+                      "unknown_codes": sorted(set(filter(None, unknown))), "duplicate_articles": duplicates}
+
+
+parse_barcode_mapping_rows = getattr(
+    supplier_logic, "parse_barcode_mapping_rows", _fallback_parse_barcode_mapping_rows)
+apply_barcode_mapping = getattr(
+    supplier_logic, "apply_barcode_mapping", _fallback_apply_barcode_mapping)
+
+# Prevent the empty-candidate crash present in one earlier deployed version.
+if hasattr(supplier_logic, "_rank_candidates"):
+    _original_rank_candidates = supplier_logic._rank_candidates
+    def _safe_rank_candidates(candidates, rules):
+        return _original_rank_candidates(candidates, rules) if candidates else []
+    supplier_logic._rank_candidates = _safe_rank_candidates
+
+
+def parse_supplier_prices(workbook, supplier_name):
+    """Prefer a barcode column even when the deployed parser is an older version."""
+    sheet = workbook[workbook.sheetnames[0]]
+    for row in sheet.iter_rows(min_row=1, max_row=min(10, sheet.max_row)):
+        barcode_cell = None
+        sku_cells = []
+        for cell in row:
+            header = re.sub(r"\s+", " ", str(cell.value or "").strip().lower().replace("_", " "))
+            if header in ("штрихкод", "штрих-код", "штрих код", "barcode", "ean", "upc"):
+                barcode_cell = cell
+            elif header in ("артикул", "sku", "код товару", "код товара", "item code", "product code"):
+                sku_cells.append(cell)
+        if barcode_cell:
+            for cell in sku_cells:
+                cell.value = "Код постачальника"
+            barcode_cell.value = "SKU"
+            break
+    return _supplier_price_parser(workbook, supplier_name)
 
 st.set_page_config(
     page_title="ProcureAI — Аналіз закупівель",
@@ -626,7 +729,7 @@ def gen_excel(data, params):
     supplier_cols = [
         ("Артикул",15),("Код у постачальника",20),("Назва",42),("Кількість",11),("Ціна прайсу",13),
         ("Ціна з кориг.",14),("Сума",14),("Знижка %",10),("Маржа %",10),
-        ("Lead time",10),("Дні до 0",10),
+        ("Lead time",10),("Дні до 0",10),("Причина вибору",44),
     ]
     used_sheet_names = set(wb.sheetnames)
     for supplier_index, supplier_config in enumerate(supplier_configs, 1):
@@ -644,20 +747,23 @@ def gen_excel(data, params):
             ws_supplier,
             f"ЗАМОВЛЕННЯ — {supplier} | {today.strftime('%d.%m.%Y')}",
             f"SKU: {len(lines)} | Кількість: {sum(line['quantity'] for line in lines)} | "
-            f"Сума: {sum(line['order_value'] for line in lines):,.2f}",
+            f"Відома сума: {sum(line['order_value'] for line in lines):,.2f} | "
+            f"Без ціни: {sum(not line.get('price_known', True) for line in lines)} SKU",
             supplier_cols,
         )
         for row_index, line in enumerate(lines, 4):
+            price_known = line.get('price_known', True)
             values = [
                 line['sku'], line.get('supplier_sku', line['sku']), line['name'], line['quantity'], line['unit_price'],
-                line['landed_unit_price'], line['order_value'], line['discount_pct'],
+                line['landed_unit_price'], line['order_value'] if price_known else None, line['discount_pct'],
                 line['margin_pct'], line['lead_time_days'], line['days_left'],
+                line.get('selection_reason', ''),
             ]
             for column_index, value in enumerate(values, 1):
                 cell = ws_supplier.cell(row=row_index, column=column_index, value=value)
                 cell.fill = fl(C['row1'] if row_index % 2 == 0 else C['white'])
                 cell.border = tb(); cell.font = cf(bold=column_index in (1,4,7), sz=10)
-                cell.alignment = la() if column_index in (1,2,3) else ca()
+                cell.alignment = la() if column_index in (1,2,3,12) else ca()
                 if column_index in (5,6,7): cell.number_format = '#,##0.00'
                 if column_index in (8,9) and value is not None: cell.number_format = '0.0"%"'
         total_row = len(lines) + 4
@@ -666,7 +772,7 @@ def gen_excel(data, params):
         total_cell = ws_supplier.cell(total_row, 7, round(sum(line['order_value'] for line in lines), 2))
         total_cell.font = hf(C['main'], sz=10); total_cell.number_format = '#,##0.00'
         ws_supplier.freeze_panes = "A4"
-        ws_supplier.auto_filter.ref = f"A3:K{max(3, len(lines)+3)}"
+        ws_supplier.auto_filter.ref = f"A3:L{max(3, len(lines)+3)}"
 
     # SKU, які не вдалося замовити в жодного постачальника
     unallocated = data.get('unallocated', [])
@@ -727,7 +833,7 @@ def gen_excel(data, params):
 
 # ── UI ───────────────────────────────────────
 st.title("📦 ProcureAI — Аналіз закупівель")
-st.caption("Шаблон продажів + два незалежні прайси → два замовлення постачальникам")
+st.caption("Розрахунок потреби → доступне замовляємо в ДСН → решту замовляємо в iHerb")
 
 with st.sidebar:
     st.header("⚙️ Параметри")
@@ -758,15 +864,20 @@ with st.sidebar:
     with st.expander("⚖️ Правила вибору постачальника", expanded=True):
         strategy_label = st.selectbox(
             "Стратегія",
-            ["Пріоритет у межах допуску", "Найнижча ціна", "Баланс ціни та строку"],
-            help="Пріоритет: обирає бажаного постачальника, якщо він не дорожчий за допустимий відсоток.",
+            ["Спочатку ДСН, решта — iHerb", "Пріоритет у межах допуску", "Найнижча ціна", "Баланс ціни та строку"],
+            help="Основне правило: усе доступне беремо в ДСН, решту включаємо в замовлення iHerb.",
         )
         strategy = {
+            "Спочатку ДСН, решта — iHerb": "secondary_first_primary_fallback",
             "Пріоритет у межах допуску": "priority_within_tolerance",
             "Найнижча ціна": "lowest_price",
             "Баланс ціни та строку": "balanced",
         }[strategy_label]
-        price_tolerance = st.slider("Допустима різниця ціни (%)", 0, 30, 5)
+        if strategy == "secondary_first_primary_fallback":
+            st.info("ДСН: беремо доступні позиції. iHerb: автоматично отримує весь залишок, навіть без ціни в прайсі.")
+            price_tolerance = 0
+        else:
+            price_tolerance = st.slider("Допустима різниця ціни (%)", 0, 30, 5)
         min_purchase_margin = st.slider("Мін. маржа після вибору прайсу (%)", 0, 60, 0)
         max_supplier_lead = st.slider("Макс. lead time постачальника (дні, 0 = без межі)", 0, 120, 0)
 
@@ -783,7 +894,7 @@ with st.sidebar:
             "Ліміт замовлення (0 = без ліміту)", 0.0, 100000000.0, 0.0, 100.0, key="supplier_1_limit")
 
     with st.expander("🏬 Постачальник 2", expanded=False):
-        supplier_2_name = st.text_input("Назва", "Постачальник 2", key="supplier_2_name")
+        supplier_2_name = st.text_input("Назва", "ДСН", key="supplier_2_name")
         supplier_2_source = st.selectbox(
             "Джерело прайсу", ["Google Sheets (автоматично)", "Excel-файл"],
             key="supplier_2_source")
@@ -816,7 +927,7 @@ supplier_configs = [
          lead_time_days=supplier_1_lead, price_adjustment_pct=supplier_1_adjustment,
          min_order_qty=supplier_1_moq, min_order_value=supplier_1_min_value,
          order_limit_value=supplier_1_limit),
-    dict(name=supplier_2_name.strip() or "Постачальник 2", priority=supplier_2_priority,
+    dict(name=supplier_2_name.strip() or "ДСН", priority=supplier_2_priority,
          lead_time_days=supplier_2_lead, price_adjustment_pct=supplier_2_adjustment,
          min_order_qty=supplier_2_moq, min_order_value=supplier_2_min_value,
          order_limit_value=supplier_2_limit),
@@ -985,10 +1096,11 @@ if f_template:
         if data['supplier_summary']:
             summary_cols = st.columns(len(data['supplier_summary']))
             for index, (supplier, summary) in enumerate(data['supplier_summary'].items()):
+                unknown_note = f" · без ціни {summary.get('unknown_price_sku', 0)}" if summary.get('unknown_price_sku') else ""
                 summary_cols[index].metric(
                     supplier,
                     f"{summary['quantity']} шт",
-                    f"{summary['sku_count']} SKU · {summary['order_value']:,.2f}",
+                    f"{summary['sku_count']} SKU · відома сума {summary['order_value']:,.2f}{unknown_note}",
                 )
         for supplier in [item['name'] for item in supplier_configs]:
             lines = data['supplier_orders'].get(supplier, [])
@@ -1003,10 +1115,11 @@ if f_template:
                 'Кількість': line['quantity'],
                 'Ціна прайсу': line['unit_price'],
                 'Ціна з коригуванням': line['landed_unit_price'],
-                'Сума': line['order_value'],
+                'Сума': line['order_value'] if line.get('price_known', True) else None,
                 'Маржа %': line['margin_pct'],
                 'Lead time': line['lead_time_days'],
                 'Дні до 0': line['days_left'],
+                'Причина вибору': line.get('selection_reason', ''),
             } for line in lines])
             st.dataframe(supplier_df, use_container_width=True, hide_index=True)
 
