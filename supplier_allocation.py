@@ -65,11 +65,16 @@ def parse_availability(value: Any, quantity: float | None = None) -> bool:
 
 HEADER_ALIASES = {
     "sku": ("sku", "артикул", "код товару", "код товара", "item code", "product code"),
-    "barcode": ("штрихкод", "штрих-код", "штрих код", "barcode", "ean", "upc"),
+    "barcode": (
+        "штрихкод", "штрих-код", "штрих код", "barcode", "ean", "ean13", "ean 13",
+        "код ean", "gtin", "upc",
+    ),
     "name": ("назва", "название", "найменування", "наименование", "name", "product"),
     "price": (
         "ціна", "цена", "price", "cost", "закупівельна ціна", "закупочная цена",
-        "purchase price", "unit price",
+        "purchase price", "unit price", "ціна грн", "цена грн", "ціна з пдв", "цена с ндс",
+        "оптова ціна", "оптовая цена", "ваша ціна", "ваша цена", "price usd",
+        "wholesale price", "прайс",
     ),
     "availability": ("наявність", "наличие", "availability", "in stock", "статус", "status"),
     "available_qty": (
@@ -251,21 +256,33 @@ def google_sheet_csv_url(sheet_url: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{match.group(1)}/export?format=csv&gid={gid}"
 
 
-def parse_supplier_prices(workbook: Any, supplier_name: str) -> tuple[dict[str, dict], list[str]]:
-    """Parse the first worksheet using multilingual, order-independent headers.
+def google_sheet_xlsx_url(sheet_url: str) -> str:
+    """Return an XLSX export URL containing every tab in a public spreadsheet."""
+
+    url = clean_text(sheet_url)
+    match = re.search(r"docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)", url)
+    if not match:
+        raise ValueError("Некоректне посилання Google Sheets")
+    return f"https://docs.google.com/spreadsheets/d/{match.group(1)}/export?format=xlsx"
+
+
+def parse_supplier_prices(
+    workbook: Any, supplier_name: str, sheet_name: str | None = None
+) -> tuple[dict[str, dict], list[str]]:
+    """Parse one worksheet using multilingual, order-independent headers.
 
     Missing optional columns are filled from supplier-level settings during allocation.
     For backward compatibility, the old iHerb layout falls back to fixed columns.
     """
 
-    sheet = workbook[workbook.sheetnames[0]]
+    sheet = workbook[sheet_name] if sheet_name else workbook[workbook.sheetnames[0]]
     rows = list(sheet.iter_rows(values_only=True))
     if not rows:
         return {}, [f"{supplier_name}: прайс порожній"]
 
     header_index = None
     columns: dict[str, int] = {}
-    for row_index, row in enumerate(rows[:10]):
+    for row_index, row in enumerate(rows[:100]):
         candidate: dict[str, int] = {}
         for column_index, value in enumerate(row):
             field = _field_for_header(value)

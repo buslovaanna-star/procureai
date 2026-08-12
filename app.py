@@ -15,6 +15,11 @@ import supplier_allocation as supplier_logic
 allocate_orders = supplier_logic.allocate_orders
 build_reference_price_map = supplier_logic.build_reference_price_map
 google_sheet_csv_url = supplier_logic.google_sheet_csv_url
+google_sheet_xlsx_url = getattr(
+    supplier_logic,
+    "google_sheet_xlsx_url",
+    lambda url: re.sub(r"/export.*$", "/export?format=xlsx", google_sheet_csv_url(url)),
+)
 _supplier_price_parser = supplier_logic.parse_supplier_prices
 
 # Compatibility with an older supplier_allocation.py that may still be cached on
@@ -103,9 +108,9 @@ if hasattr(supplier_logic, "_rank_candidates"):
     supplier_logic._rank_candidates = _safe_rank_candidates
 
 
-def parse_supplier_prices(workbook, supplier_name):
+def parse_supplier_prices(workbook, supplier_name, sheet_name=None):
     """Prefer a barcode column even when the deployed parser is an older version."""
-    sheet = workbook[workbook.sheetnames[0]]
+    sheet = workbook[sheet_name] if sheet_name else workbook[workbook.sheetnames[0]]
     for row in sheet.iter_rows(min_row=1, max_row=min(10, sheet.max_row)):
         barcode_cell = None
         sku_cells = []
@@ -120,7 +125,17 @@ def parse_supplier_prices(workbook, supplier_name):
                 cell.value = "Код постачальника"
             barcode_cell.value = "SKU"
             break
-    return _supplier_price_parser(workbook, supplier_name)
+    try:
+        return _supplier_price_parser(workbook, supplier_name, sheet_name=sheet.title)
+    except TypeError:
+        # Older deployed parser accepts only the first tab. Copy the selected tab
+        # to a temporary workbook so it can still be scanned.
+        if sheet.title == workbook.sheetnames[0]:
+            return _supplier_price_parser(workbook, supplier_name)
+        temporary = Workbook(); target = temporary.active; target.title = sheet.title[:31]
+        for row in sheet.iter_rows(values_only=True):
+            target.append(list(row))
+        return _supplier_price_parser(temporary, supplier_name)
 
 st.set_page_config(
     page_title="ProcureAI — Аналіз закупівель",
@@ -184,8 +199,8 @@ def load_barcode_mapping():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def load_google_sheet_prices(sheet_url, supplier_name):
-    """Read a public Google Sheet as CSV and reuse the normal price parser."""
-    export_url = google_sheet_csv_url(sheet_url)
+    """Read every tab of a public Google Sheet and select the actual price tab."""
+    export_url = google_sheet_xlsx_url(sheet_url)
     request = Request(export_url, headers={"User-Agent": "ProcureAI/1.0"})
     try:
         with urlopen(request, timeout=20) as response:
@@ -196,17 +211,53 @@ def load_google_sheet_prices(sheet_url, supplier_name):
     except URLError as exc:
         raise ValueError("Не вдалося підключитися до Google Sheets") from exc
 
-    text = payload.decode("utf-8-sig", errors="replace")
-    if "text/html" in content_type.lower() or text.lstrip().lower().startswith("<!doctype html"):
+    text_preview = payload[:500].decode("utf-8-sig", errors="replace")
+    if "text/html" in content_type.lower() or text_preview.lstrip().lower().startswith("<!doctype html"):
         raise ValueError("Таблиця не опублікована для перегляду за посиланням")
 
+    if payload[:2] == b"PK":
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(payload), data_only=True)
+        except Exception as exc:
+            raise ValueError("Google Sheets повернув пошкоджений Excel-файл") from exc
+        candidates = []
+        for sheet_name in workbook.sheetnames:
+            offers, warnings = parse_supplier_prices(workbook, supplier_name, sheet_name=sheet_name)
+            recognised = not any("заголовки не розпізнано" in warning for warning in warnings)
+            candidates.append((recognised, len(offers), sheet_name, offers, warnings))
+        if not candidates:
+            raise ValueError("Google Sheet не містить вкладок")
+        _, _, selected_sheet, offers, warnings = max(candidates, key=lambda item: (item[0], item[1]))
+        if len(workbook.sheetnames) > 1:
+            warnings = [f"{supplier_name}: обрано вкладку «{selected_sheet}»"] + warnings
+        if not offers:
+            sheet = workbook[selected_sheet]
+            preview_headers = []
+            for row in sheet.iter_rows(min_row=1, max_row=min(20, sheet.max_row), values_only=True):
+                filled = [str(value).strip() for value in row if value not in (None, "")]
+                if filled:
+                    preview_headers.append(" | ".join(filled[:8]))
+                if len(preview_headers) >= 3:
+                    break
+            warnings.append(
+                f"{supplier_name}: на вкладці «{selected_sheet}» не знайдено товарів. "
+                f"Перші рядки: {' / '.join(preview_headers) or 'порожньо'}"
+            )
+        return offers, warnings
+
+    # Compatibility fallback for servers or tests returning the selected tab as CSV.
+    text = payload.decode("utf-8-sig", errors="replace")
     rows = list(csv.reader(io.StringIO(text)))
     if not rows:
         raise ValueError("Google Sheet не містить даних")
     workbook = Workbook(); worksheet = workbook.active
     for row in rows:
         worksheet.append(row)
-    return parse_supplier_prices(workbook, supplier_name)
+    offers, warnings = parse_supplier_prices(workbook, supplier_name)
+    if not offers:
+        headers = " / ".join(" | ".join(cell for cell in row[:8] if cell) for row in rows[:3])
+        warnings.append(f"{supplier_name}: не знайдено товарів. Перші рядки: {headers or 'порожньо'}")
+    return offers, warnings
 
 # ── Парсинг шаблону ───────────────────────────
 def parse_template(wb):
