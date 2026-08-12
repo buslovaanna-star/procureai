@@ -241,6 +241,8 @@ def _margin_pct(sell_price: float | None, landed_price: float) -> float | None:
 
 
 def _rank_candidates(candidates: list[dict], rules: dict) -> list[dict]:
+    if not candidates:
+        return []
     strategy = rules.get("strategy", "priority_within_tolerance")
     if strategy == "lowest_price":
         return sorted(candidates, key=lambda item: (item["landed_price"], item["lead_time_days"], item["priority"]))
