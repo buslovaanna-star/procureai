@@ -65,6 +65,7 @@ def parse_availability(value: Any, quantity: float | None = None) -> bool:
 
 HEADER_ALIASES = {
     "sku": ("sku", "артикул", "код товару", "код товара", "item code", "product code"),
+    "barcode": ("штрихкод", "штрих-код", "штрих код", "barcode", "ean", "upc"),
     "name": ("назва", "название", "найменування", "наименование", "name", "product"),
     "price": (
         "ціна", "цена", "price", "cost", "закупівельна ціна", "закупочная цена",
@@ -86,6 +87,9 @@ HEADER_ALIASES = {
     ),
 }
 
+BARCODE_HEADER_ALIASES = ("штрихкод", "штрих-код", "штрих код", "barcode", "ean", "upc")
+ARTICLE_HEADER_ALIASES = ("артикул", "sku", "код товару", "код товара", "article")
+
 
 def _normalise_header(value: Any) -> str:
     text = clean_text(value).lower().replace("_", " ")
@@ -102,6 +106,133 @@ def _field_for_header(value: Any) -> str | None:
             if header == alias_norm or (len(alias_norm) >= 5 and alias_norm in header):
                 return field
     return None
+
+
+def normalise_product_code(value: Any) -> str:
+    """Return a stable text key without dropping leading zeroes from barcodes."""
+
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        return str(int(value)) if value.is_integer() else format(value, "f").rstrip("0").rstrip(".")
+
+    text = clean_text(value).strip("'\"")
+    text = re.sub(r"\s+", "", text)
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    return text
+
+
+def parse_barcode_mapping_rows(rows: Iterable[Iterable[Any]]) -> tuple[dict[str, str], dict]:
+    """Parse a barcode-to-article table and report skipped or ambiguous rows."""
+
+    values = [tuple(row) for row in rows]
+    header_index = None
+    article_column = None
+    barcode_column = None
+    for row_index, row in enumerate(values[:10]):
+        for column_index, value in enumerate(row):
+            header = _normalise_header(value)
+            if header in ARTICLE_HEADER_ALIASES and article_column is None:
+                article_column = column_index
+            if header in BARCODE_HEADER_ALIASES and barcode_column is None:
+                barcode_column = column_index
+        if article_column is not None and barcode_column is not None:
+            header_index = row_index
+            break
+
+    if header_index is None:
+        return {}, {
+            "total_rows": 0, "valid_pairs": 0, "empty_rows": 0, "conflicts": [],
+            "error": "Не знайдено колонки «Артикул» і «Штрихкод»",
+        }
+
+    mapping: dict[str, str] = {}
+    conflicts: list[dict] = []
+    empty_rows = 0
+    valid_pairs = 0
+    article_barcodes: dict[str, set[str]] = {}
+    for row in values[header_index + 1 :]:
+        article = clean_text(row[article_column] if article_column < len(row) else None)
+        barcode = normalise_product_code(row[barcode_column] if barcode_column < len(row) else None)
+        if not article or not barcode:
+            empty_rows += 1
+            continue
+        existing = mapping.get(barcode)
+        if existing and existing != article:
+            conflicts.append({"barcode": barcode, "articles": sorted({existing, article})})
+            continue
+        mapping[barcode] = article
+        article_barcodes.setdefault(article, set()).add(barcode)
+        valid_pairs += 1
+
+    return mapping, {
+        "total_rows": max(0, len(values) - header_index - 1),
+        "valid_pairs": valid_pairs,
+        "unique_barcodes": len(mapping),
+        "unique_articles": len(article_barcodes),
+        "articles_with_multiple_barcodes": sum(1 for codes in article_barcodes.values() if len(codes) > 1),
+        "empty_rows": empty_rows,
+        "conflicts": conflicts,
+        "error": "",
+    }
+
+
+def apply_barcode_mapping(
+    offers: dict[str, dict], barcode_map: dict[str, str]
+) -> tuple[dict[str, dict], dict]:
+    """Replace supplier barcodes with internal articles and keep an audit trail."""
+
+    remapped: dict[str, dict] = {}
+    mapped_count = 0
+    direct_sku_count = 0
+    unknown_codes: list[str] = []
+    duplicate_articles: list[dict] = []
+
+    for source_code, source_offer in offers.items():
+        normalised_code = normalise_product_code(source_code)
+        article = barcode_map.get(normalised_code)
+        if article:
+            mapped_count += 1
+        elif re.search(r"[A-Za-zА-Яа-яІіЇїЄє]", normalised_code):
+            article = clean_text(source_code)
+            direct_sku_count += 1
+        else:
+            unknown_codes.append(normalised_code or clean_text(source_code))
+            continue
+
+        offer = dict(source_offer)
+        offer["sku"] = article
+        offer["supplier_sku"] = clean_text(source_code)
+        offer["barcode"] = normalised_code if normalised_code in barcode_map else ""
+
+        existing = remapped.get(article)
+        if existing is not None:
+            duplicate_articles.append({
+                "article": article,
+                "supplier_codes": [existing.get("supplier_sku", ""), offer["supplier_sku"]],
+            })
+            offer = min(
+                [existing, offer],
+                key=lambda item: (
+                    0 if item.get("in_stock") else 1,
+                    item.get("price", math.inf),
+                    -(item.get("available_qty") or 0),
+                ),
+            )
+        remapped[article] = offer
+
+    return remapped, {
+        "source_offers": len(offers),
+        "mapped_by_barcode": mapped_count,
+        "direct_sku": direct_sku_count,
+        "unknown_codes": sorted(set(code for code in unknown_codes if code)),
+        "duplicate_articles": duplicate_articles,
+    }
 
 
 def google_sheet_csv_url(sheet_url: str) -> str:
@@ -140,7 +271,7 @@ def parse_supplier_prices(workbook: Any, supplier_name: str) -> tuple[dict[str, 
             field = _field_for_header(value)
             if field and field not in candidate:
                 candidate[field] = column_index
-        if "sku" in candidate and "price" in candidate:
+        if ("sku" in candidate or "barcode" in candidate) and "price" in candidate:
             header_index = row_index
             columns = candidate
             break
@@ -160,8 +291,10 @@ def parse_supplier_prices(workbook: Any, supplier_name: str) -> tuple[dict[str, 
     offers: dict[str, dict] = {}
     invalid_price_count = 0
     for row in rows[header_index + 1 :]:
-        sku = clean_text(get(row, "sku"))
-        if not sku or _normalise_header(sku) in HEADER_ALIASES["sku"]:
+        # When both are present, prefer barcode: supplier articles may not match
+        # the internal SKU, while barcode mapping is unambiguous.
+        sku = clean_text(get(row, "barcode")) or clean_text(get(row, "sku"))
+        if not sku or _normalise_header(sku) in (*HEADER_ALIASES["sku"], *HEADER_ALIASES["barcode"]):
             continue
         price = safe_number(get(row, "price"))
         if price is None or price <= 0:
@@ -363,6 +496,8 @@ def _allocate_once(
                 {
                     "supplier": supplier,
                     "sku": sku,
+                    "supplier_sku": candidate["offer"].get("supplier_sku", sku),
+                    "barcode": candidate["offer"].get("barcode", ""),
                     "name": clean_text(line.get("name")),
                     "quantity": qty,
                     "unit_price": round(float(candidate["offer"]["price"]), 4),

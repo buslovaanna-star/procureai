@@ -6,13 +6,16 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import csv, math, io, re
 from datetime import date, timedelta
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from supplier_allocation import (
+    apply_barcode_mapping,
     allocate_orders,
     build_reference_price_map,
     google_sheet_csv_url,
+    parse_barcode_mapping_rows,
     parse_supplier_prices,
 )
 
@@ -64,6 +67,16 @@ def mo_year(label):
 @st.cache_data(show_spinner=False)
 def load_wb(file_bytes):
     return openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_barcode_mapping():
+    """Load the repository copy converted from the user's legacy XLS table."""
+    path = Path(__file__).with_name("barcode_mapping.csv")
+    if not path.exists():
+        return {}, {"error": "Файл barcode_mapping.csv відсутній"}
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
+        return parse_barcode_mapping_rows(csv.reader(source))
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -611,7 +624,7 @@ def gen_excel(data, params):
     supplier_orders = data.get('supplier_orders', {})
     supplier_configs = data.get('supplier_configs', [])
     supplier_cols = [
-        ("SKU",13),("Назва",42),("Кількість",11),("Ціна прайсу",13),
+        ("Артикул",15),("Код у постачальника",20),("Назва",42),("Кількість",11),("Ціна прайсу",13),
         ("Ціна з кориг.",14),("Сума",14),("Знижка %",10),("Маржа %",10),
         ("Lead time",10),("Дні до 0",10),
     ]
@@ -636,24 +649,24 @@ def gen_excel(data, params):
         )
         for row_index, line in enumerate(lines, 4):
             values = [
-                line['sku'], line['name'], line['quantity'], line['unit_price'],
+                line['sku'], line.get('supplier_sku', line['sku']), line['name'], line['quantity'], line['unit_price'],
                 line['landed_unit_price'], line['order_value'], line['discount_pct'],
                 line['margin_pct'], line['lead_time_days'], line['days_left'],
             ]
             for column_index, value in enumerate(values, 1):
                 cell = ws_supplier.cell(row=row_index, column=column_index, value=value)
                 cell.fill = fl(C['row1'] if row_index % 2 == 0 else C['white'])
-                cell.border = tb(); cell.font = cf(bold=column_index in (1,3,6), sz=10)
-                cell.alignment = la() if column_index in (1,2) else ca()
-                if column_index in (4,5,6): cell.number_format = '#,##0.00'
-                if column_index in (7,8) and value is not None: cell.number_format = '0.0"%"'
+                cell.border = tb(); cell.font = cf(bold=column_index in (1,4,7), sz=10)
+                cell.alignment = la() if column_index in (1,2,3) else ca()
+                if column_index in (5,6,7): cell.number_format = '#,##0.00'
+                if column_index in (8,9) and value is not None: cell.number_format = '0.0"%"'
         total_row = len(lines) + 4
         ws_supplier.cell(total_row, 1, "ВСЬОГО").font = hf(C['main'], sz=10)
-        ws_supplier.cell(total_row, 3, sum(line['quantity'] for line in lines)).font = hf(C['main'], sz=10)
-        total_cell = ws_supplier.cell(total_row, 6, round(sum(line['order_value'] for line in lines), 2))
+        ws_supplier.cell(total_row, 4, sum(line['quantity'] for line in lines)).font = hf(C['main'], sz=10)
+        total_cell = ws_supplier.cell(total_row, 7, round(sum(line['order_value'] for line in lines), 2))
         total_cell.font = hf(C['main'], sz=10); total_cell.number_format = '#,##0.00'
         ws_supplier.freeze_panes = "A4"
-        ws_supplier.auto_filter.ref = f"A3:J{max(3, len(lines)+3)}"
+        ws_supplier.auto_filter.ref = f"A3:K{max(3, len(lines)+3)}"
 
     # SKU, які не вдалося замовити в жодного постачальника
     unallocated = data.get('unallocated', [])
@@ -679,6 +692,35 @@ def gen_excel(data, params):
             cell.alignment = la() if column_index in (1,2,6) else ca()
     ws_unallocated.freeze_panes = "A4"
     ws_unallocated.auto_filter.ref = f"A3:F{max(3, len(unallocated)+3)}"
+
+    # Аудит кодів другого постачальника, які не вдалося зіставити
+    mapping_audits = data.get('barcode_mapping_audits', {})
+    audit_rows = []
+    for supplier, audit in mapping_audits.items():
+        for code in audit.get('unknown_codes', []):
+            audit_rows.append([supplier, "Не знайдено відповідність", code, ""])
+        for duplicate in audit.get('duplicate_articles', []):
+            audit_rows.append([
+                supplier, "Кілька кодів одного артикулу",
+                ", ".join(duplicate.get('supplier_codes', [])), duplicate.get('article', ""),
+            ])
+    ws_codes = wb.create_sheet("Контроль штрихкодів")
+    code_cols = [("Постачальник",22),("Статус",31),("Код у прайсі",25),("Артикул",18)]
+    ws_init(
+        ws_codes,
+        f"КОНТРОЛЬ ШТРИХКОДІВ — {len(audit_rows)} записів для перевірки",
+        "Невідомі коди не включаються до замовлення, доки для них не додано відповідність.",
+        code_cols,
+        "880E4F", "FCE4EC",
+    )
+    for row_index, values in enumerate(audit_rows, 4):
+        for column_index, value in enumerate(values, 1):
+            cell = ws_codes.cell(row=row_index, column=column_index, value=value)
+            cell.fill = fl(C['low_l'] if row_index % 2 == 0 else C['white'])
+            cell.border = tb(); cell.font = cf(bold=column_index in (2,3), sz=10)
+            cell.alignment = la()
+    ws_codes.freeze_panes = "A4"
+    ws_codes.auto_filter.ref = f"A3:D{max(3, len(audit_rows)+3)}"
 
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
@@ -822,8 +864,30 @@ if f_template:
         st.stop()
 
     price_maps = {supplier_configs[0]['name']: {}, supplier_configs[1]['name']: {}}
+    barcode_map, barcode_map_info = load_barcode_mapping()
+    mapping_audits = {}
+    if barcode_map_info.get("error"):
+        st.warning(f"Таблиця штрихкодів: {barcode_map_info['error']}")
+    else:
+        st.caption(
+            f"🔗 Таблиця відповідності: {barcode_map_info['unique_barcodes']:,} штрихкодів → "
+            f"{barcode_map_info['unique_articles']:,} артикулів"
+        )
 
-    def show_price_result(supplier_name, offers, price_warnings, source_label):
+    def show_price_result(supplier_name, offers, price_warnings, source_label, map_barcodes=False):
+        if map_barcodes and barcode_map:
+            offers, mapping_audit = apply_barcode_mapping(offers, barcode_map)
+            mapping_audits[supplier_name] = mapping_audit
+            if mapping_audit['mapped_by_barcode']:
+                price_warnings.append(
+                    f"{supplier_name}: зіставлено {mapping_audit['mapped_by_barcode']} штрихкодів з артикулами"
+                )
+            if mapping_audit['unknown_codes']:
+                examples = ", ".join(mapping_audit['unknown_codes'][:8])
+                price_warnings.append(
+                    f"{supplier_name}: не знайдено {len(mapping_audit['unknown_codes'])} кодів "
+                    f"у таблиці відповідності ({examples})"
+                )
         price_maps[supplier_name] = offers
         st.success(
             f"✅ {supplier_name} ({source_label}): {len(offers)} SKU, "
@@ -842,7 +906,8 @@ if f_template:
             with st.spinner(f"Оновлюємо онлайн-прайс: {supplier_configs[1]['name']}..."):
                 offers, price_warnings = load_google_sheet_prices(
                     supplier_2_google_url, supplier_configs[1]['name'])
-            show_price_result(supplier_configs[1]['name'], offers, price_warnings, "Google Sheets")
+            show_price_result(
+                supplier_configs[1]['name'], offers, price_warnings, "Google Sheets", map_barcodes=True)
         except ValueError as exc:
             st.error(f"❌ Не вдалося прочитати онлайн-прайс: {exc}")
             st.caption("У Google Sheets встановіть доступ: Усі, хто має посилання → Читач.")
@@ -850,7 +915,7 @@ if f_template:
         with st.spinner(f"Читаємо прайс: {supplier_configs[1]['name']}..."):
             wb_p = load_wb(f_prices_2.read())
             offers, price_warnings = parse_prices(wb_p, supplier_configs[1]['name'])
-        show_price_result(supplier_configs[1]['name'], offers, price_warnings, "Excel")
+        show_price_result(supplier_configs[1]['name'], offers, price_warnings, "Excel", map_barcodes=True)
     if not any(price_maps.values()):
         st.info("💡 Прайси не завантажено — потреба буде розрахована, але SKU залишаться нерозподіленими")
 
@@ -886,6 +951,7 @@ if f_template:
     data['excluded_suppliers'] = allocation['excluded_suppliers']
     data['supplier_configs'] = supplier_configs
     data['allocation_rules'] = allocation_rules
+    data['barcode_mapping_audits'] = mapping_audits
 
     meta     = data['meta']
     regular  = data['regular']
@@ -931,7 +997,8 @@ if f_template:
                 st.info("Немає позицій для цього постачальника")
                 continue
             supplier_df = pd.DataFrame([{
-                'SKU': line['sku'],
+                'Артикул': line['sku'],
+                'Код у постачальника': line.get('supplier_sku', line['sku']),
                 'Назва': line['name'][:60],
                 'Кількість': line['quantity'],
                 'Ціна прайсу': line['unit_price'],
