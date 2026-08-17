@@ -371,6 +371,25 @@ def parse_prices(wb, supplier_name="iHerb"):
     """Compatibility wrapper around the configurable supplier price parser."""
     return parse_supplier_prices(wb, supplier_name)
 
+
+def calculate_price_stats(offers):
+    """Return compact catalogue, availability and discount statistics."""
+    total_sku = len(offers)
+    in_stock_sku = sum(1 for offer in offers.values() if offer.get('in_stock'))
+    discounted_in_stock_sku = sum(
+        1 for offer in offers.values()
+        if offer.get('in_stock') and float(offer.get('discount_pct') or 0) > 0
+    )
+    discounted_pct = (
+        discounted_in_stock_sku / in_stock_sku * 100 if in_stock_sku else 0
+    )
+    return {
+        'total_sku': total_sku,
+        'in_stock_sku': in_stock_sku,
+        'discounted_in_stock_sku': discounted_in_stock_sku,
+        'discounted_pct': discounted_pct,
+    }
+
 # ── Основний аналіз ───────────────────────────
 def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, params):
     today     = date.today()
@@ -1051,9 +1070,12 @@ if f_template:
                     f"у таблиці відповідності ({examples})"
                 )
         price_maps[supplier_name] = offers
+        stats = calculate_price_stats(offers)
         st.success(
-            f"✅ {supplier_name} ({source_label}): {len(offers)} SKU, "
-            f"в наявності {sum(1 for offer in offers.values() if offer['in_stock'])}")
+            f"✅ {supplier_name} ({source_label}): {stats['total_sku']} SKU, "
+            f"в наявності {stats['in_stock_sku']}, "
+            f"зі знижкою {stats['discounted_in_stock_sku']} SKU — "
+            f"{stats['discounted_pct']:.1f}% від наявних")
         for warning in price_warnings:
             st.warning(warning)
 
