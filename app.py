@@ -390,6 +390,122 @@ def calculate_price_stats(offers):
         'discounted_pct': discounted_pct,
     }
 
+
+def assign_demand_abc(rows):
+    """Assign demand ABC by cumulative average daily demand (70/20/10)."""
+    ranked = sorted(rows, key=lambda row: (-float(row.get('avg_day') or 0), row.get('sku', '')))
+    total_demand = sum(max(0.0, float(row.get('avg_day') or 0)) for row in ranked)
+    cumulative = 0.0
+    for row in ranked:
+        demand = max(0.0, float(row.get('avg_day') or 0))
+        share_before = cumulative / total_demand if total_demand else 1.0
+        row['abc_demand'] = 'A' if share_before < 0.70 else ('B' if share_before < 0.90 else 'C')
+        cumulative += demand
+    return rows
+
+
+def _priority_details(row):
+    """Calculate an explainable ordering priority for one SKU."""
+    stock = float(row.get('stock') or 0)
+    days_left = float(row.get('days_left', 999) or 0)
+    abc_demand = row.get('abc_demand', 'C')
+    abc_mi = row.get('abc_mi', '?')
+    trend = row.get('trend', '—')
+
+    if stock <= 0:
+        priority_class, urgency_points, start_day = 'P1', 60, 1
+        urgency_reason = 'немає на складі'
+    elif days_left <= 3:
+        priority_class, urgency_points, start_day = 'P1', 55, 1
+        urgency_reason = 'запас на 1–3 дні'
+    elif days_left <= 7:
+        priority_class, urgency_points, start_day = 'P2', 45, 2
+        urgency_reason = 'запас на 4–7 днів'
+    elif days_left <= 14:
+        priority_class, urgency_points, start_day = 'P3', 30, 3
+        urgency_reason = 'запас на 8–14 днів'
+    elif days_left <= 30:
+        priority_class, urgency_points, start_day = 'P4', 15, 4
+        urgency_reason = 'запас на 15–30 днів'
+    else:
+        priority_class, urgency_points, start_day = 'P5', 5, 5
+        urgency_reason = 'запас понад 30 днів'
+
+    demand_points = {'A': 25, 'B': 12, 'C': 3}.get(abc_demand, 0)
+    value_points = {'A': 5, 'B': 2}.get(abc_mi, 0)
+    trend_points = 5 if trend in ('↑ зростає', '↑ новий') else 0
+    score = urgency_points + demand_points + value_points + trend_points
+    reasons = [urgency_reason, f'ABC попиту {abc_demand}']
+    if abc_mi in ('A', 'B'):
+        reasons.append(f'ABC_MI {abc_mi}')
+    if trend_points:
+        reasons.append('попит зростає')
+    return priority_class, score, start_day, '; '.join(reasons)
+
+
+def build_weekly_priority_plan(supplier_orders, analysis_rows, batch_cover_days=7, work_days=5):
+    """Build a five-day logistics queue and split quantities into smaller batches."""
+    analysis_by_sku = {row.get('sku'): row for row in analysis_rows}
+    enriched = []
+    for supplier, lines in supplier_orders.items():
+        for line in lines:
+            analysis = analysis_by_sku.get(line.get('sku'), {})
+            priority_class, score, start_day, reason = _priority_details(analysis)
+            enriched.append((
+                line, supplier, analysis, priority_class, score, start_day, reason,
+            ))
+
+    enriched.sort(key=lambda item: (
+        item[5], -item[4], -float(item[2].get('avg_day') or 0), item[0].get('sku', ''), item[1],
+    ))
+    sku_rank = {}
+    next_rank = 1
+    for line, *_ in enriched:
+        sku = line.get('sku')
+        if sku not in sku_rank:
+            sku_rank[sku] = next_rank
+            next_rank += 1
+
+    day_labels = ['День 1 · Пн', 'День 2 · Вт', 'День 3 · Ср', 'День 4 · Чт', 'День 5 · Пт']
+    plan = []
+    for line, supplier, analysis, priority_class, score, start_day, reason in enriched:
+        total_qty = max(0, int(round(float(line.get('quantity') or 0))))
+        if total_qty <= 0:
+            continue
+        avg_day = max(0.0, float(analysis.get('avg_day') or 0))
+        natural_batch = max(1, math.ceil(avg_day * max(1, batch_cover_days))) if avg_day else total_qty
+        available_days = max(1, work_days - start_day + 1)
+        batch_count = min(available_days, max(1, math.ceil(total_qty / natural_batch)))
+        base_qty, extra = divmod(total_qty, batch_count)
+        for batch_index in range(batch_count):
+            batch_qty = base_qty + (1 if batch_index < extra else 0)
+            planned_day = min(work_days, start_day + batch_index)
+            plan.append({
+                'priority_rank': sku_rank[line.get('sku')],
+                'planned_day': planned_day,
+                'planned_day_label': day_labels[planned_day - 1],
+                'priority_class': priority_class,
+                'priority_score': score,
+                'priority_reason': reason,
+                'sku': line.get('sku'),
+                'supplier_sku': line.get('supplier_sku', line.get('sku')),
+                'name': line.get('name', ''),
+                'supplier': supplier,
+                'batch_no': batch_index + 1,
+                'batch_count': batch_count,
+                'batch_qty': batch_qty,
+                'total_order_qty': total_qty,
+                'abc_demand': analysis.get('abc_demand', 'C'),
+                'abc_mi': analysis.get('abc_mi', '?'),
+                'avg_day': avg_day,
+                'stock': analysis.get('stock', 0),
+                'transit': analysis.get('transit', 0),
+                'days_left': analysis.get('days_left', 999),
+            })
+    return sorted(plan, key=lambda row: (
+        row['planned_day'], row['priority_rank'], row['batch_no'], row['supplier'],
+    ))
+
 # ── Основний аналіз ───────────────────────────
 def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, params):
     today     = date.today()
@@ -557,6 +673,9 @@ def run_analysis(sku_data, months_labels, stock_map, avail_map, price_map, param
         elif ta and mi >= ta:   r['abc_mi'] = 'A'
         elif tb and mi >= tb:   r['abc_mi'] = 'B'
         else:                   r['abc_mi'] = 'C'
+
+    # Окрема ABC-класифікація саме за швидкістю попиту (70/20/10).
+    assign_demand_abc(results)
 
     meta = dict(season_K=season_K, global_avg=global_avg, n_months=n,
                 cur_day=CUR_DAY, cur_scale=cur_scale,
@@ -869,6 +988,46 @@ def gen_excel(data, params):
     ws_unallocated.freeze_panes = "A4"
     ws_unallocated.auto_filter.ref = f"A3:F{max(3, len(unallocated)+3)}"
 
+    # Головний робочий аркуш логіста: пріоритет і невеликі партії на 5 днів.
+    priority_plan = data.get('priority_plan', [])
+    ws_plan = wb.create_sheet("План логіста", 0)
+    plan_cols = [
+        ("Черга",8),("День",14),("Пріоритет",10),("Бал",8),("Артикул",15),
+        ("Код постачальника",20),("Назва",40),("Постачальник",17),("Партія",9),
+        ("Замовити зараз",15),("Всього замовити",16),("ABC попиту",11),("ABC_MI",9),
+        ("Продаж/день",13),("Залишок",10),("Транзит",10),("Днів до 0",11),("Чому зараз",48),
+    ]
+    ws_init(
+        ws_plan,
+        f"ПЛАН ЛОГІСТА НА 5 ДНІВ | {today.strftime('%d.%m.%Y')} | {len(priority_plan)} партій",
+        f"Методика: дефіцит → дні до нуля → ABC попиту 70/20/10 → тренд та ABC_MI. "
+        f"Орієнтир партії: {params.get('batch_cover_days', 7)} днів попиту.",
+        plan_cols,
+    )
+    priority_fills = {'P1': C['red_l'], 'P2': C['amber_l'], 'P3': C['gold_l'],
+                      'P4': C['green_l'], 'P5': C['blue_l']}
+    priority_fonts = {'P1': C['red'], 'P2': C['amber'], 'P3': C['gold'],
+                      'P4': C['green'], 'P5': C['blue']}
+    for row_index, line in enumerate(priority_plan, 4):
+        values = [
+            line['priority_rank'], line['planned_day_label'], line['priority_class'],
+            line['priority_score'], line['sku'], line['supplier_sku'], line['name'],
+            line['supplier'], f"{line['batch_no']}/{line['batch_count']}", line['batch_qty'],
+            line['total_order_qty'], line['abc_demand'], line['abc_mi'], line['avg_day'],
+            line['stock'], line['transit'], line['days_left'] if line['days_left'] < 999 else None,
+            line['priority_reason'],
+        ]
+        bg = priority_fills.get(line['priority_class'], C['white'])
+        for column_index, value in enumerate(values, 1):
+            cell = ws_plan.cell(row=row_index, column=column_index, value=value)
+            cell.fill = fl(bg); cell.border = tb()
+            cell.font = cf(bold=column_index in (1,3,5,10), sz=10,
+                           color=priority_fonts.get(line['priority_class'], "000000") if column_index == 3 else "000000")
+            cell.alignment = la() if column_index in (5,6,7,8,18) else ca()
+            if column_index == 14: cell.number_format = '#,##0.000'
+    ws_plan.freeze_panes = "A4"
+    ws_plan.auto_filter.ref = f"A3:R{max(3, len(priority_plan)+3)}"
+
     # Аудит кодів другого постачальника, які не вдалося зіставити
     mapping_audits = data.get('barcode_mapping_audits', {})
     audit_rows = []
@@ -925,6 +1084,12 @@ with st.sidebar:
         min_months = st.slider("Мін. місяців з продажами", 2, 9, 6)
         min_qty    = st.slider("Мін. продано штук", 1, 30, 12)
         low_avail  = st.slider("Поріг низької наявності (%)", 10, 40, 20)
+    with st.expander("📅 План логіста на 5 днів", expanded=True):
+        batch_cover_days = st.slider(
+            "Розмір невеликої партії (днів попиту)", 1, 14, 7,
+            help="Орієнтир для поділу загальної кількості на партії. Загальна потреба не змінюється.",
+        )
+        st.caption("P1 — понеділок, P2 — вівторок, P3 — середа, P4 — четвер, P5 — п’ятниця.")
     with st.expander("🔢 Коефіцієнти", expanded=False):
         avail_alpha = st.slider("Коефіцієнт наявності α", 0.3, 1.5, 0.7, 0.05,
                                 help="avail_K = (наявн%)^α")
@@ -987,7 +1152,8 @@ params = dict(mg_min=mg_min, mg_a=mg_a, a_mult=a_mult,
               lead=lead, safety=safety, safety60=safety60, safety90=safety90,
               disc_thr=disc_thr, disc_thr2=disc_thr2,
               min_months=min_months, min_qty=min_qty, low_avail=low_avail,
-              avail_alpha=avail_alpha, lambda_val=lambda_val)
+              avail_alpha=avail_alpha, lambda_val=lambda_val,
+              batch_cover_days=batch_cover_days)
 
 if supplier_2_name.strip() == supplier_1_name.strip():
     supplier_2_name = f"{supplier_2_name.strip()} 2"
@@ -1136,6 +1302,8 @@ if f_template:
     data['supplier_configs'] = supplier_configs
     data['allocation_rules'] = allocation_rules
     data['barcode_mapping_audits'] = mapping_audits
+    data['priority_plan'] = build_weekly_priority_plan(
+        allocation['orders'], data['regular'], params['batch_cover_days'], work_days=5)
 
     meta     = data['meta']
     regular  = data['regular']
@@ -1160,10 +1328,50 @@ if f_template:
     for i,(lbl,lo,hi) in enumerate(buckets):
         cols_b[i].metric(lbl, sum(1 for r in regular if lo<=r['days_left']<hi))
 
-    tab1,tab2,tab3,tab4,tab5 = st.tabs([
-        "🏪 Розподіл", "🛒 Загальна потреба", "📋 Аналіз SKU",
+    tab_plan,tab1,tab2,tab3,tab4,tab5 = st.tabs([
+        "📅 План логіста", "🏪 Розподіл", "🛒 Загальна потреба", "📋 Аналіз SKU",
         "⚠️ Ручне рішення", "📦 Разовий попит",
     ])
+
+    with tab_plan:
+        priority_plan = data['priority_plan']
+        if priority_plan:
+            st.markdown("#### Тижнева черга замовлень")
+            st.caption(
+                "Спочатку дефіцит і найкоротший запас, потім ABC попиту, зростання та ABC_MI. "
+                f"Партія ≈ {params['batch_cover_days']} днів попиту; загальна кількість замовлення не змінюється."
+            )
+            daily_columns = st.columns(5)
+            for day in range(1, 6):
+                day_rows = [row for row in priority_plan if row['planned_day'] == day]
+                daily_columns[day - 1].metric(
+                    f"День {day}",
+                    f"{sum(row['batch_qty'] for row in day_rows)} шт",
+                    f"{len({row['sku'] for row in day_rows})} SKU · {len(day_rows)} партій",
+                )
+            plan_df = pd.DataFrame([{
+                'Черга': row['priority_rank'],
+                'День': row['planned_day_label'],
+                'Пріоритет': row['priority_class'],
+                'Бал': row['priority_score'],
+                'Артикул': row['sku'],
+                'Код постачальника': row['supplier_sku'],
+                'Назва': row['name'][:60],
+                'Постачальник': row['supplier'],
+                'Партія': f"{row['batch_no']}/{row['batch_count']}",
+                'Замовити зараз': row['batch_qty'],
+                'Всього замовити': row['total_order_qty'],
+                'ABC попиту': row['abc_demand'],
+                'ABC_MI': row['abc_mi'],
+                'Продаж/день': round(row['avg_day'], 3),
+                'Залишок': row['stock'],
+                'Транзит': row['transit'],
+                'Днів до 0': row['days_left'] if row['days_left'] < 999 else '∞',
+                'Чому зараз': row['priority_reason'],
+            } for row in priority_plan])
+            st.dataframe(plan_df, use_container_width=True, hide_index=True, height=600)
+        else:
+            st.success("Немає позицій для тижневого замовлення")
 
     with tab1:
         if data['supplier_summary']:
